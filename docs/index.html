@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TST Sensor Firmware Update</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 600px;
+      margin: 60px auto;
+      padding: 0 20px;
+      color: #222;
+    }
+    h1 { font-size: 1.6rem; margin-bottom: 4px; }
+    .subtitle { color: #666; margin-bottom: 40px; }
+    .device {
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    .device h2 { margin: 0 0 4px; font-size: 1.1rem; }
+    .device .version { color: #888; font-size: 0.85rem; margin-bottom: 16px; }
+    .instructions {
+      font-size: 0.85rem;
+      color: #555;
+      margin-top: 14px;
+      line-height: 1.6;
+    }
+    esp-web-install-button {
+      --esp-tools-button-color: #0066cc;
+      --esp-tools-button-text-color: white;
+    }
+  </style>
+</head>
+<body>
+  <h1>TST Sensor Firmware Update</h1>
+  <p class="subtitle">Connect your device via USB and click the button below.</p>
+
+  <div class="device">
+    <h2>TST Sensor StickC Plus</h2>
+    <div class="version" id="version-cplus">Loading version...</div>
+    <esp-web-install-button manifest="StickCPlus/manifest.json"></esp-web-install-button>
+    <p class="instructions">
+      Requires Google Chrome or Microsoft Edge.<br>
+      Hold the side button while connecting USB if the device is not detected.
+    </p>
+  </div>
+
+  <div class="device">
+    <h2>TST Sensor StickC Plus 2</h2>
+    <div class="version" id="version-cplus2">Loading version...</div>
+    <esp-web-install-button manifest="StickCPlus2/manifest.json"></esp-web-install-button>
+    <p class="instructions">
+      Requires Google Chrome or Microsoft Edge.<br>
+      Hold the side button while connecting USB if the device is not detected.
+    </p>
+  </div>
+
+  <script>
+    async function loadVersion(manifestPath, elementId) {
+      try {
+        const res = await fetch(manifestPath);
+        const data = await res.json();
+        document.getElementById(elementId).textContent = "Firmware v" + data.version;
+      } catch {
+        document.getElementById(elementId).textContent = "";
+      }
+    }
+    loadVersion("StickCPlus/manifest.json", "version-cplus");
+    loadVersion("StickCPlus2/manifest.json", "version-cplus2");
+  </script>
+</body>
+</html>

@@ -1,0 +1,1173 @@
+#include <M5StickCPlus2.h>
+#undef min  // to fix issue: defining min() as this is vulnerable to the double evaluation problem and considered bad practice.
+#include <ArduinoBLE.h>
+#include "Arduino.h"
+#include <Wire.h>
+#include "TSTLogo.h"
+#include "Arrows.h"
+#include "Bluetooth.h"
+#include "BatteryFull.h"
+#include "BatteryHalf.h"
+#include "BatteryEmpty.h"
+#include "S1.h"
+#include "S2.h"
+#include "S3.h"
+#include "S4.h"
+
+#include <RunningAverage.h>
+#include <RunningMedian.h>  // Rob Tillaart's RunningMedian library
+#include "FFT.h"            // Replaced ArduinoFFT with FFT.h
+#include <Preferences.h>
+
+
+Preferences preferences;
+
+const char *DEVICE_NAME[] = { "TST Sensor 1", "TST Sensor 2", "TST Sensor 3", "TST Sensor 4" };
+
+#define SOFTWARE_VERSION "v5.5 Unified"
+
+//Change Log:
+// v5.5: Unified measurement - one FFT for both frequency and amplitude
+//       Mode switch only controls BLE output, not measurement type
+//       Combined FFT function extracts both freq and amplitude efficiently
+// v5.4: FFT for freq and amplitude, min/max frequencies, running median
+// v5.3: Improved battery monitoring, max 60 Hz frequency detection
+
+#define BLE_UUID_ACC_SERVICE "b3d94f96-7fb4-11ed-a1eb-0242ac120002"
+#define BLE_UUID_FREQ "57fcccde-7fb4-11ed-a1eb-0242ac120002"
+#define BLE_UUID_AMPX "57fcd116-7fb4-11ed-a1eb-0242ac120002"
+#define BLE_UUID_AMPY "57fcd328-7fb4-11ed-a1eb-0242ac120002"
+#define BLE_UUID_AMPZ "57fcd67a-7fb4-11ed-a1eb-0242ac120002"
+#define BLE_UUID_MODE "57fcd83c-7fb4-11ed-a1eb-0242ac120002"
+
+// Bluetooth® Low Energy Battery Service
+BLEService AccService(BLE_UUID_ACC_SERVICE);
+
+// Bluetooth® Low Energy accelerometer Level Characteristic
+BLEFloatCharacteristic Freq(BLE_UUID_FREQ, BLERead | BLENotify);
+BLEFloatCharacteristic Ampx(BLE_UUID_AMPX, BLERead | BLENotify);
+BLEFloatCharacteristic Ampy(BLE_UUID_AMPY, BLERead | BLENotify);
+BLEFloatCharacteristic Ampz(BLE_UUID_AMPZ, BLERead | BLENotify);
+BLEByteCharacteristic Mode(BLE_UUID_MODE, BLERead | BLEWrite);
+
+
+// FFT Configuration
+#define SAMPLING_FREQ 500.0
+#define FFT_SIZE 1024               // Fixed sample size
+#define AXIS_DETECTION_SAMPLES 200  // 0.4 seconds at 500Hz
+#define MEASURE_FFT_SIZE 1024       // For amplitude measurement
+
+// Simplified FFT variables
+bool axis_detection_complete = false;
+int fft_sample_count = 0;
+
+// Amplitude filtering configuration
+#define MAX_REASONABLE_AMPLITUDE 8.0   // Maximum physically reasonable amplitude in g
+#define MIN_REASONABLE_AMPLITUDE 0.01  // Minimum meaningful amplitude in g
+#define MEDIAN_FILTER_SIZE 10          // Size of median filter buffer
+#define CORRECTION_FACTOR 1.00         // Amplitude adjustment for accelerometer
+
+const uint16_t *DEVICE_IMAGES[] = { S1, S2, S3, S4 };
+
+// Battery detection constants
+const int BATTERY_VOLTAGE_FULL = 4200;
+const int BATTERY_VOLTAGE_LOW = 3800;
+const int VOLTAGE_JUMP_THRESHOLD = 50;
+const int BATTERY_LEVEL_MID = 50;
+const int BATTERY_LEVEL_LOW = 25;
+
+
+
+
+// Axis detection
+enum Axis {
+  X_AXIS = 0,
+  Y_AXIS = 1,
+  Z_AXIS = 2
+};
+
+struct AxisStats {
+  float max_value;
+  float min_value;
+  const char *name;
+};
+
+// FFT result structure (must be defined before functions that use it)
+struct FFTResult {
+  float frequency;
+  float amplitude;
+};
+
+AxisStats axis_stats[3] = {
+  { -999, 999, "X" },
+  { -999, 999, "Y" },
+  { -999, 999, "Z" }
+};
+
+Axis selected_axis = X_AXIS;
+
+// Simplified sampling buffers
+float measure_buffers[3][MEASURE_FFT_SIZE];  // For all measurements [axis][sample]
+
+unsigned int sampling_period_us;
+
+// Running averages Battery
+RunningAverage RaBatLvl(5);
+RunningAverage RaVBat(20);
+
+// Amplitude filtering objects
+RunningMedian ampX_median(MEDIAN_FILTER_SIZE);
+RunningMedian ampY_median(MEDIAN_FILTER_SIZE);
+RunningMedian ampZ_median(MEDIAN_FILTER_SIZE);
+
+
+float outputAmpX = 0, outputAmpY = 0, outputAmpZ = 0;
+
+const int buttonPin = 35;
+const int ledPin = 19;
+
+const uint16_t imageWidth = 240;
+const uint16_t imageHeight = 135;
+
+int VBat;
+int prevVBat;
+int prevVBatAvg1 = 0;
+int prevVBatAvg2 = 0;
+int prevVBatAvg3 = 0;
+int BatLevel;
+int BatLvlAvg;
+int VBatAvg;
+
+float sampleFreq = 500;
+
+float Xzero, Yzero, Zzero;
+float Xfactor, Yfactor, Zfactor;
+
+unsigned long printTime;
+unsigned long printInterval = 750;
+unsigned long ledTime;
+unsigned long ledInterval = 2000;
+unsigned long pressTime;
+unsigned long debounceInterval = 200;
+unsigned long refreshTime;
+unsigned long refreshInterval = 2000;
+unsigned long updateBatTime;
+unsigned long updateBatInterval = 5000;
+unsigned long startupDelay = 1500;
+unsigned long connectTime;
+unsigned long disconnectTime;
+unsigned long autoOff = 120000;
+
+float lowestFreq = 2.0;
+float highestFreq = 60.0;
+float outputFreq = 0.0;
+
+const int SpeakerTone = 4000;
+
+byte Modus = 0;
+byte wasConnected = 0;
+byte deviceNumber;
+byte batIcon = 0;
+bool isCharging;
+bool batFull = false;
+bool buttonState = false;
+bool prevButtonState = false;
+
+
+
+// FFT helper functions
+void parabola(float x1, float y1, float x2, float y2, float x3, float y3, float *a, float *b, float *c) {
+  // Fit parabola y = ax² + bx + c through 3 points
+  // For consecutive integer x values (i-1, i, i+1), this simplifies to:
+  float denom = (x1 - x2) * (x1 - x3) * (x2 - x3);
+  if (abs(denom) < 1e-10) {
+    // Degenerate case - set to simple peak
+    *a = 0;
+    *b = 0;
+    *c = y2;
+    return;
+  }
+
+  *a = (x3 * (y2 - y1) + x2 * (y1 - y3) + x1 * (y3 - y2)) / denom;
+  *b = (x3 * x3 * (y1 - y2) + x2 * x2 * (y3 - y1) + x1 * x1 * (y2 - y3)) / denom;
+  *c = (x2 * x3 * (x2 - x3) * y1 + x3 * x1 * (x3 - x1) * y2 + x1 * x2 * (x1 - x2) * y3) / denom;
+}
+
+void removeDC(float *data, int size) {
+  float mean = 0.0;
+  for (int i = 0; i < size; i++) {
+    mean += data[i];
+  }
+  mean /= size;
+
+  for (int i = 0; i < size; i++) {
+    data[i] -= mean;
+  }
+}
+
+void applyHanningWindow(float *data, int size, float *window_correction) {
+  float sum_window = 0.0;
+
+  for (int i = 0; i < size; i++) {
+    float window_coeff = 0.5 * (1.0 - cos(2.0 * PI * i / (size - 1)));
+    data[i] *= window_coeff;
+    sum_window += window_coeff;
+  }
+
+  *window_correction = sum_window / size;
+  Serial.printf("Window correction factor: %.4f (expected ~0.5)\n", *window_correction);
+}
+
+float performFFTAnalysis(float *input_data, int size) {
+  // Allocate memory for FFT
+  float *fft_input = (float *)malloc(size * sizeof(float));
+  float *fft_output = (float *)malloc(size * sizeof(float));
+
+  if (!fft_input || !fft_output) {
+    Serial.println("FFT memory allocation failed!");
+    if (fft_input) free(fft_input);
+    if (fft_output) free(fft_output);
+    return 0.0;
+  }
+
+  // Copy input data
+  for (int i = 0; i < size; i++) {
+    fft_input[i] = input_data[i];
+  }
+
+  // Preprocessing
+  float window_correction = 1.0;
+  removeDC(fft_input, size);
+  applyHanningWindow(fft_input, size, &window_correction);
+
+  // Initialize and execute FFT
+  fft_config_t *fft_plan = fft_init(size, FFT_REAL, FFT_FORWARD, fft_input, fft_output);
+  if (!fft_plan) {
+    Serial.println("FFT initialization failed!");
+    free(fft_input);
+    free(fft_output);
+    return 0.0;
+  }
+
+  fft_execute(fft_plan);
+
+  // Find peak frequency with parabolic interpolation
+  float max_magnitude = 0;
+  int peak_bin = 0;
+  float peak_frequency = 0;
+
+  // First pass: find the peak bin in machine range (5-50 Hz)
+  int start_bin = max(1, (int)(lowestFreq * size / SAMPLING_FREQ));
+  int end_bin = min(size / 2 - 1, (int)(highestFreq * size / SAMPLING_FREQ));
+
+  for (int k = start_bin; k <= end_bin; k++) {
+    float real_part = fft_plan->output[2 * k];
+    float imag_part = fft_plan->output[2 * k + 1];
+    float magnitude = sqrt(real_part * real_part + imag_part * imag_part);
+
+    if (magnitude > max_magnitude) {
+      max_magnitude = magnitude;
+      peak_bin = k;
+    }
+  }
+
+  // Second pass: parabolic interpolation for sub-bin precision
+  if (peak_bin > start_bin && peak_bin < end_bin && max_magnitude > 0) {
+    // Get magnitudes of peak and neighboring bins
+    float mag_left, mag_center, mag_right;
+
+    // Left neighbor
+    float real_left = fft_plan->output[2 * (peak_bin - 1)];
+    float imag_left = fft_plan->output[2 * (peak_bin - 1) + 1];
+    mag_left = sqrt(real_left * real_left + imag_left * imag_left);
+
+    // Center (peak)
+    float real_center = fft_plan->output[2 * peak_bin];
+    float imag_center = fft_plan->output[2 * peak_bin + 1];
+    mag_center = sqrt(real_center * real_center + imag_center * imag_center);
+
+    // Right neighbor
+    float real_right = fft_plan->output[2 * (peak_bin + 1)];
+    float imag_right = fft_plan->output[2 * (peak_bin + 1) + 1];
+    mag_right = sqrt(real_right * real_right + imag_right * imag_right);
+
+    // Fit parabola through the 3 points
+    float a, b, c;
+    parabola(peak_bin - 1, mag_left, peak_bin, mag_center, peak_bin + 1, mag_right, &a, &b, &c);
+
+    // Find parabola peak for sub-bin precision
+    if (abs(a) > 1e-10) {  // Valid parabola
+      float precise_bin = -b / (2.0 * a);
+
+      // Sanity check: interpolated peak should be near the original peak
+      if (precise_bin >= (peak_bin - 1) && precise_bin <= (peak_bin + 1)) {
+        peak_frequency = (precise_bin * SAMPLING_FREQ) / size;
+        Serial.printf("Interpolated: bin %.3f -> %.3f Hz (was bin %d -> %.3f Hz)\n",
+                      precise_bin, peak_frequency, peak_bin, (peak_bin * SAMPLING_FREQ) / size);
+      } else {
+        // Fall back to simple bin frequency
+        peak_frequency = (peak_bin * SAMPLING_FREQ) / size;
+        Serial.printf("Interpolation out of range, using bin frequency: %.3f Hz\n", peak_frequency);
+      }
+    } else {
+      // Fall back to simple bin frequency
+      peak_frequency = (peak_bin * SAMPLING_FREQ) / size;
+      Serial.printf("Invalid parabola, using bin frequency: %.3f Hz\n", peak_frequency);
+    }
+  } else {
+    // Peak at edge or no valid peak, use simple bin frequency
+    peak_frequency = (peak_bin * SAMPLING_FREQ) / size;
+    Serial.printf("Edge case, using bin frequency: %.3f Hz\n", peak_frequency);
+  }
+
+  fft_destroy(fft_plan);
+  free(fft_input);
+  free(fft_output);
+
+  return peak_frequency;
+}
+
+float calculateFFTAmplitude(float *input_data, int size) {
+  // Similar to performFFTAnalysis but returns amplitude instead of frequency
+  float *fft_input = (float *)malloc(size * sizeof(float));
+  float *fft_output = (float *)malloc(size * sizeof(float));
+
+  if (!fft_input || !fft_output) {
+    if (fft_input) free(fft_input);
+    if (fft_output) free(fft_output);
+    return 0.0;
+  }
+
+  for (int i = 0; i < size; i++) {
+    fft_input[i] = input_data[i];
+  }
+
+  float window_correction = 1.0;
+  removeDC(fft_input, size);
+  applyHanningWindow(fft_input, size, &window_correction);
+
+  fft_config_t *fft_plan = fft_init(size, FFT_REAL, FFT_FORWARD, fft_input, fft_output);
+  if (!fft_plan) {
+    free(fft_input);
+    free(fft_output);
+    return 0.0;
+  }
+
+  fft_execute(fft_plan);
+
+  // Find peak amplitude in machine range with interpolation
+  float max_magnitude = 0;
+  int peak_bin = 0;
+
+  // First pass: find the peak bin in machine range (5-50 Hz)
+  int start_bin = max(1, (int)(lowestFreq * size / SAMPLING_FREQ));
+  int end_bin = min(size / 2 - 1, (int)(highestFreq * size / SAMPLING_FREQ));
+
+  for (int k = start_bin; k <= end_bin; k++) {
+    float real_part = fft_plan->output[2 * k];
+    float imag_part = fft_plan->output[2 * k + 1];
+    float magnitude = sqrt(real_part * real_part + imag_part * imag_part);
+
+    if (magnitude > max_magnitude) {
+      max_magnitude = magnitude;
+      peak_bin = k;
+    }
+  }
+  Serial.printf("AMPLITUDE DEBUG: peak_bin=%d (%.2f Hz), magnitude=%.3f\n",
+                peak_bin, peak_bin * SAMPLING_FREQ / size, max_magnitude);
+  // Second pass: parabolic interpolation for more accurate amplitude
+  float interpolated_magnitude = max_magnitude;
+
+  if (peak_bin > start_bin && peak_bin < end_bin && max_magnitude > 0) {
+    // Get magnitudes of peak and neighboring bins
+    float mag_left, mag_center, mag_right;
+
+    // Left neighbor
+    float real_left = fft_plan->output[2 * (peak_bin - 1)];
+    float imag_left = fft_plan->output[2 * (peak_bin - 1) + 1];
+    mag_left = sqrt(real_left * real_left + imag_left * imag_left);
+
+    // Center (peak)
+    float real_center = fft_plan->output[2 * peak_bin];
+    float imag_center = fft_plan->output[2 * peak_bin + 1];
+    mag_center = sqrt(real_center * real_center + imag_center * imag_center);
+
+    // Right neighbor
+    float real_right = fft_plan->output[2 * (peak_bin + 1)];
+    float imag_right = fft_plan->output[2 * (peak_bin + 1) + 1];
+    mag_right = sqrt(real_right * real_right + imag_right * imag_right);
+
+    // Fit parabola through the 3 points
+    float a, b, c;
+    parabola(peak_bin - 1, mag_left, peak_bin, mag_center, peak_bin + 1, mag_right, &a, &b, &c);
+
+    // Find parabola peak magnitude
+    if (abs(a) > 1e-10) {  // Valid parabola
+      float precise_bin = -b / (2.0 * a);
+
+      // Calculate interpolated magnitude at parabola peak
+      if (precise_bin >= (peak_bin - 1) && precise_bin <= (peak_bin + 1)) {
+        interpolated_magnitude = a * precise_bin * precise_bin + b * precise_bin + c;
+        // // Ensure interpolated magnitude is reasonable
+        // if (interpolated_magnitude > max_magnitude * 1.5) {
+        //   interpolated_magnitude = max_magnitude;  // Fallback if interpolation seems wrong
+        // }
+      }
+    }
+  }
+
+  // Convert magnitude to amplitude
+  float amplitude = CORRECTION_FACTOR * ((interpolated_magnitude * 2) / (size * window_correction));
+
+  // // Calculate raw amplitude (like Python does)
+  // float raw_amplitude = (max_magnitude * 2) / (size * window_correction);
+
+  // // Compare with interpolated amplitude
+  // Serial.printf("AMPLITUDE COMPARISON:\n");
+  // Serial.printf("  Raw bin amplitude (like Python): %.4f g\n", raw_amplitude);
+  // Serial.printf("  Interpolated amplitude (Arduino): %.4f g\n", amplitude);
+  // Serial.printf("  Improvement from interpolation: %.1f%%\n",
+  //               ((amplitude - raw_amplitude) / raw_amplitude) * 100);
+  // Serial.printf("  Peak bin: %d, Frequency: %.2f Hz\n",
+  //               peak_bin, peak_bin * SAMPLING_FREQ / size);
+
+  // // Also check if peak is exactly on a bin or between bins
+  // float exact_bin = peak_bin * SAMPLING_FREQ / size;
+  // float bin_center_freq = peak_bin * SAMPLING_FREQ / size;
+  // Serial.printf("  Bin center frequency: %.2f Hz\n", bin_center_freq);
+  // Serial.println("---");
+
+
+  fft_destroy(fft_plan);
+  free(fft_input);
+  free(fft_output);
+
+  return amplitude;
+}
+
+// New function: Calculate amplitude at a SPECIFIC frequency (not searching for peak)
+float calculateAmplitudeAtFrequency(float *input_data, int size, float target_freq) {
+  float *fft_input = (float *)malloc(size * sizeof(float));
+  float *fft_output = (float *)malloc(size * sizeof(float));
+
+  if (!fft_input || !fft_output) {
+    if (fft_input) free(fft_input);
+    if (fft_output) free(fft_output);
+    return 0.0;
+  }
+
+  for (int i = 0; i < size; i++) {
+    fft_input[i] = input_data[i];
+  }
+
+  float window_correction = 1.0;
+  removeDC(fft_input, size);
+  applyHanningWindow(fft_input, size, &window_correction);
+
+  fft_config_t *fft_plan = fft_init(size, FFT_REAL, FFT_FORWARD, fft_input, fft_output);
+  if (!fft_plan) {
+    free(fft_input);
+    free(fft_output);
+    return 0.0;
+  }
+
+  fft_execute(fft_plan);
+
+  // Calculate the target bin directly from the frequency
+  int target_bin = round(target_freq * size / SAMPLING_FREQ);
+
+  // Ensure target_bin is valid for interpolation (need neighbors)
+  if (target_bin < 1) target_bin = 1;
+  if (target_bin >= size / 2 - 1) target_bin = size / 2 - 2;
+
+  // Get magnitude at target bin and neighbors
+  float real_left = fft_plan->output[2 * (target_bin - 1)];
+  float imag_left = fft_plan->output[2 * (target_bin - 1) + 1];
+  float mag_left = sqrt(real_left * real_left + imag_left * imag_left);
+
+  float real_center = fft_plan->output[2 * target_bin];
+  float imag_center = fft_plan->output[2 * target_bin + 1];
+  float mag_center = sqrt(real_center * real_center + imag_center * imag_center);
+
+  float real_right = fft_plan->output[2 * (target_bin + 1)];
+  float imag_right = fft_plan->output[2 * (target_bin + 1) + 1];
+  float mag_right = sqrt(real_right * real_right + imag_right * imag_right);
+
+  // Parabolic interpolation for more accurate amplitude
+  float interpolated_magnitude = mag_center;
+
+  float a, b, c;
+  parabola(target_bin - 1, mag_left, target_bin, mag_center, target_bin + 1, mag_right, &a, &b, &c);
+
+  if (abs(a) > 1e-10) {
+    float precise_bin = -b / (2.0 * a);
+    if (precise_bin >= (target_bin - 1) && precise_bin <= (target_bin + 1)) {
+      interpolated_magnitude = a * precise_bin * precise_bin + b * precise_bin + c;
+    }
+  }
+
+  // Convert magnitude to amplitude
+  float amplitude = CORRECTION_FACTOR * ((interpolated_magnitude * 2) / (size * window_correction));
+
+  fft_destroy(fft_plan);
+  free(fft_input);
+  free(fft_output);
+
+  return amplitude;
+}
+
+// Combined function: Returns BOTH frequency AND amplitude from one FFT
+// This avoids running two separate FFTs on the same data
+FFTResult performCombinedFFT(float *input_data, int size) {
+  FFTResult result = {0.0, 0.0};
+
+  float *fft_input = (float *)malloc(size * sizeof(float));
+  float *fft_output = (float *)malloc(size * sizeof(float));
+
+  if (!fft_input || !fft_output) {
+    if (fft_input) free(fft_input);
+    if (fft_output) free(fft_output);
+    return result;
+  }
+
+  for (int i = 0; i < size; i++) {
+    fft_input[i] = input_data[i];
+  }
+
+  float window_correction = 1.0;
+  removeDC(fft_input, size);
+  applyHanningWindow(fft_input, size, &window_correction);
+
+  fft_config_t *fft_plan = fft_init(size, FFT_REAL, FFT_FORWARD, fft_input, fft_output);
+  if (!fft_plan) {
+    free(fft_input);
+    free(fft_output);
+    return result;
+  }
+
+  fft_execute(fft_plan);
+
+  // Find peak bin in frequency range
+  float max_magnitude = 0;
+  int peak_bin = 0;
+
+  int start_bin = max(1, (int)(lowestFreq * size / SAMPLING_FREQ));
+  int end_bin = min(size / 2 - 1, (int)(highestFreq * size / SAMPLING_FREQ));
+
+  for (int k = start_bin; k <= end_bin; k++) {
+    float real_part = fft_plan->output[2 * k];
+    float imag_part = fft_plan->output[2 * k + 1];
+    float magnitude = sqrt(real_part * real_part + imag_part * imag_part);
+
+    if (magnitude > max_magnitude) {
+      max_magnitude = magnitude;
+      peak_bin = k;
+    }
+  }
+
+  // Parabolic interpolation for both frequency AND amplitude
+  float interpolated_magnitude = max_magnitude;
+  float peak_frequency = (peak_bin * SAMPLING_FREQ) / size;
+
+  if (peak_bin > start_bin && peak_bin < end_bin && max_magnitude > 0) {
+    float real_left = fft_plan->output[2 * (peak_bin - 1)];
+    float imag_left = fft_plan->output[2 * (peak_bin - 1) + 1];
+    float mag_left = sqrt(real_left * real_left + imag_left * imag_left);
+
+    float real_center = fft_plan->output[2 * peak_bin];
+    float imag_center = fft_plan->output[2 * peak_bin + 1];
+    float mag_center = sqrt(real_center * real_center + imag_center * imag_center);
+
+    float real_right = fft_plan->output[2 * (peak_bin + 1)];
+    float imag_right = fft_plan->output[2 * (peak_bin + 1) + 1];
+    float mag_right = sqrt(real_right * real_right + imag_right * imag_right);
+
+    float a, b, c;
+    parabola(peak_bin - 1, mag_left, peak_bin, mag_center, peak_bin + 1, mag_right, &a, &b, &c);
+
+    if (abs(a) > 1e-10) {
+      float precise_bin = -b / (2.0 * a);
+      if (precise_bin >= (peak_bin - 1) && precise_bin <= (peak_bin + 1)) {
+        peak_frequency = (precise_bin * SAMPLING_FREQ) / size;
+        interpolated_magnitude = a * precise_bin * precise_bin + b * precise_bin + c;
+      }
+    }
+  }
+
+  // Calculate amplitude from magnitude
+  float amplitude = CORRECTION_FACTOR * ((interpolated_magnitude * 2) / (size * window_correction));
+
+  fft_destroy(fft_plan);
+  free(fft_input);
+  free(fft_output);
+
+  result.frequency = peak_frequency;
+  result.amplitude = amplitude;
+  return result;
+}
+
+// Amplitude filtering function
+float MedianAmplitude(float raw_amplitude, int axis) {
+  // Step 1: Physical range check
+  if (raw_amplitude < MIN_REASONABLE_AMPLITUDE) {
+    raw_amplitude = 0.0;
+  } else if (raw_amplitude > MAX_REASONABLE_AMPLITUDE) {
+    Serial.printf("Warning: Amplitude %.3f g exceeds reasonable limit, clamping\n", raw_amplitude);
+    raw_amplitude = MAX_REASONABLE_AMPLITUDE;
+  }
+
+  // Step 2: Add to appropriate median filter and return result
+  switch (axis) {
+    case 0:  // X-axis
+      ampX_median.add(raw_amplitude);
+      return ampX_median.getMedian();
+    case 1:  // Y-axis
+      ampY_median.add(raw_amplitude);
+      return ampY_median.getMedian();
+    case 2:  // Z-axis
+      ampZ_median.add(raw_amplitude);
+      return ampZ_median.getMedian();
+    default:
+      return raw_amplitude;  // No filtering
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  preferences.begin("Calibration", true);
+
+  sampling_period_us = round(1000000 * (1.0 / SAMPLING_FREQ));
+
+  Xzero = preferences.getFloat("Xzero", 0.00);
+  Xfactor = preferences.getFloat("Xfactor", 0.00);
+  Yzero = preferences.getFloat("Yzero", 0.00);
+  Yfactor = preferences.getFloat("Yfactor", 0.00);
+  Zzero = preferences.getFloat("Zzero", 0.00);
+  Zfactor = preferences.getFloat("Zfactor", 0.00);
+
+  auto cfg = M5.config();
+  StickCP2.begin(cfg);
+
+  // Increase IMU sample rate to 1kHz (SMPLRT_DIV = 0)
+  Wire1.beginTransmission(0x68);  // MPU6886 I2C address
+  Wire1.write(0x19);              // SMPLRT_DIV register
+  Wire1.write(0x00);              // Divider = 0 -> 1000 Hz output rate
+  Wire1.endTransmission();
+  Serial.println("IMU sample rate set to 1kHz");
+
+  StickCP2.Display.setRotation(1);
+  StickCP2.Display.setTextColor(WHITE);
+  StickCP2.Display.setFont(&fonts::FreeSansBold9pt7b);
+  StickCP2.Display.setTextSize(1);
+
+  pinMode(buttonPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // while (!Serial)
+  //   ;
+
+  // begin initialization
+  if (!BLE.begin()) {
+    StickCP2.Display.setCursor(20, 15);
+    StickCP2.Display.println("BLE failed      ");
+    while (1)
+      ;
+  }
+
+  Serial.println(DEVICE_NAME[deviceNumber]);
+  BLE.setDeviceName(DEVICE_NAME[deviceNumber]);
+  BLE.setLocalName(DEVICE_NAME[deviceNumber]);
+  BLE.setAdvertisedService(AccService);
+  AccService.addCharacteristic(Freq);
+  AccService.addCharacteristic(Ampx);
+  AccService.addCharacteristic(Ampy);
+  AccService.addCharacteristic(Ampz);
+  AccService.addCharacteristic(Mode);
+  BLE.addService(AccService);
+  Freq.writeValue(outputFreq);
+  Ampx.writeValue(outputAmpX);
+  Ampy.writeValue(outputAmpY);
+  Ampz.writeValue(outputAmpZ);
+  Mode.writeValue(Modus);
+
+  StickCP2.update();
+  StickCP2.Display.setSwapBytes(true);
+  StickCP2.Display.setRotation(3);
+  StickCP2.Display.pushImage(0, 0, imageWidth, imageHeight, TSTLogo);
+  StickCP2.Display.drawString(SOFTWARE_VERSION, 150, 20, 1);
+
+  delay(3000);
+
+  StickCP2.Display.fillScreen(BLACK);
+  StickCP2.Display.pushImage(0, 0, 145, 135, Arrows);
+  refreshDisplay();
+
+  // Clear amplitude filters
+  ampX_median.clear();
+  ampY_median.clear();
+  ampZ_median.clear();
+
+  BatLevel = StickCP2.Power.getBatteryLevel();
+  VBat = StickCP2.Power.getBatteryVoltage();
+  RaBatLvl.fillValue(BatLevel, 5);
+  RaVBat.fillValue(VBat, 20);
+
+
+  Serial.println("Stored calibration values: ");
+  Serial.println();
+  Serial.print("Zero values:             ");
+  Serial.print("X: ");
+  Serial.print(Xzero);
+  Serial.print(" Y: ");
+  Serial.print(Yzero);
+  Serial.print(" Z: ");
+  Serial.print(Zzero);
+  Serial.println();
+
+  Serial.print("Multiplication factors:  ");
+  Serial.print("X: ");
+  Serial.print(Xfactor);
+  Serial.print(" Y: ");
+  Serial.print(Yfactor);
+  Serial.print(" Z: ");
+  Serial.print(Zfactor);
+  Serial.println();
+  Serial.println();
+
+  isCharging = false;
+  prevVBat = VBat;
+
+  // Simple FFT initialization
+  axis_detection_complete = false;
+  fft_sample_count = 0;
+
+  Serial.printf("FFT initialized: %d samples at %.0f Hz (%.2f Hz resolution)\n",
+                FFT_SIZE, SAMPLING_FREQ, SAMPLING_FREQ / FFT_SIZE);
+
+  float test_signal[MEASURE_FFT_SIZE];
+  for (int i = 0; i < MEASURE_FFT_SIZE; i++) {
+    test_signal[i] = 2.0 * sin(2.0 * PI * 10.0 * i / 500.0);  // 2g amplitude at 10Hz
+  }
+  float test_amplitude = calculateFFTAmplitude(test_signal, MEASURE_FFT_SIZE);
+  Serial.printf("Test signal amplitude: Expected=2.0g, Measured=%.3fg\n", test_amplitude);
+}
+
+void loop() {
+  BLEDevice central = BLE.central();
+  BLE.poll();
+  StickCP2.update();
+  StickCP2.Imu.update();
+
+  if (millis() - pressTime > debounceInterval) {
+    buttonState = digitalRead(buttonPin);
+    if (buttonState != prevButtonState) {
+      if (buttonState == false) {
+        StickCP2.Speaker.tone(SpeakerTone, 50);
+        if (deviceNumber < 3) {
+          deviceNumber++;
+        } else {
+          deviceNumber = 0;
+        }
+        refreshDisplay();
+        Serial.println(DEVICE_NAME[deviceNumber]);
+        BLE.setDeviceName(DEVICE_NAME[deviceNumber]);
+        BLE.setLocalName(DEVICE_NAME[deviceNumber]);
+      }
+    }
+    prevButtonState = buttonState;
+  }
+
+  if (StickCP2.BtnA.wasPressed()) {
+    StickCP2.Speaker.tone(SpeakerTone, 50);
+  }
+
+  if (StickCP2.BtnA.wasReleased()) {
+    if (deviceNumber < 3) {
+      deviceNumber++;
+    } else {
+      deviceNumber = 0;
+    }
+    refreshDisplay();
+    Serial.println(DEVICE_NAME[deviceNumber]);
+    BLE.setDeviceName(DEVICE_NAME[deviceNumber]);
+    BLE.setLocalName(DEVICE_NAME[deviceNumber]);
+  }
+
+  if (millis() - refreshTime >= refreshInterval) {
+    refreshTime = millis();
+    refreshDisplay();
+    Serial.println(VBatAvg);
+    Serial.println(isCharging);
+  }
+
+  // if (isCharging) {
+  //   BLE.stopAdvertise();
+  // } else {
+  BLE.advertise();
+  // }
+
+  if (central) {
+    connectTime = millis();
+    while (central.connected()) {
+      wasConnected = 1;
+      disconnectTime = millis();
+      if (Mode.written()) {
+        Modus = Mode.value();
+        StickCP2.Display.pushImage(0, 0, 145, 135, Arrows);
+        StickCP2.Display.pushImage(100, 0, 40, 75, Bluetooth);
+
+        // Simple FFT state reset when mode changes
+        axis_detection_complete = false;
+        fft_sample_count = 0;
+
+        // Reset axis stats
+        for (int i = 0; i < 3; i++) {
+          axis_stats[i].max_value = -999;
+          axis_stats[i].min_value = 999;
+        }
+
+        // Clear amplitude filters
+        ampX_median.clear();
+        ampY_median.clear();
+        ampZ_median.clear();
+
+        Serial.println("Mode changed - FFT state reset");
+      }
+
+      if (millis() - connectTime >= startupDelay) {
+        // v5.5: Always run unified measurement (gets both frequency AND amplitude)
+        PerformMeasurement();
+
+        // Mode only controls which values are sent via BLE
+        if (Modus == 0) {
+          // Mode 0: Output frequency
+          if (central.rssi() != 0) {
+            Freq.writeValue(outputFreq);
+            Ampx.writeValue(0.00);
+            Ampy.writeValue(0.00);
+            Ampz.writeValue(0.00);
+          }
+        } else {
+          // Mode 1: Output amplitudes
+          if (millis() - printTime >= printInterval) {
+            printTime = millis();
+            if (central.rssi() != 0) {
+              Ampx.writeValue(outputAmpX);
+              Ampy.writeValue(outputAmpY);
+              Ampz.writeValue(outputAmpZ);
+            }
+          }
+          if (millis() - ledTime >= ledInterval) {
+            digitalWrite(ledPin, HIGH);
+            delay(20);
+            digitalWrite(ledPin, LOW);
+            ledTime = millis();
+          }
+          if (millis() - refreshTime >= refreshInterval) {
+            refreshTime = millis();
+            refreshDisplay();
+          }
+        }
+      }
+    }
+  }
+
+  Modus = 0;
+
+  if (wasConnected == 1) {
+    autoOff = 60000;
+  }
+  if (millis() - disconnectTime > autoOff) {
+    StickCP2.Power.powerOff();
+  }
+}
+
+// UNIFIED MEASUREMENT FUNCTION v5.5
+// Does both frequency detection AND amplitude measurement in one operation
+// Mode switch only controls which values are sent via BLE
+void PerformMeasurement(void) {
+  static unsigned long collection_start_time = 0;
+
+  // Phase 1: Axis Detection (run once per mode change)
+  if (!axis_detection_complete) {
+    Serial.println("Starting axis detection...");
+
+    // Collect samples rapidly for axis detection
+    for (int i = 0; i < AXIS_DETECTION_SAMPLES; i++) {
+      unsigned long newTime = micros();
+      StickCP2.Imu.update();
+      auto data = StickCP2.Imu.getImuData();
+
+      float samples[3] = {
+        (data.accel.x - Xzero) * Xfactor,
+        (data.accel.y - Yzero) * Yfactor,
+        (data.accel.z - Zzero) * Zfactor
+      };
+      // Update axis statistics
+      for (int axis = 0; axis < 3; axis++) {
+        float value = samples[axis];
+        if (value > axis_stats[axis].max_value) {
+          axis_stats[axis].max_value = value;
+        }
+        if (value < axis_stats[axis].min_value) {
+          axis_stats[axis].min_value = value;
+        }
+      }
+
+      while ((micros() - newTime) < sampling_period_us) {
+        /* chill */
+      }
+    }
+
+    // Select axis with highest range
+    float best_range = 0;
+    int best_axis = 0;
+
+    Serial.println("Axis Detection Complete:");
+    for (int axis = 0; axis < 3; axis++) {
+      float range = axis_stats[axis].max_value - axis_stats[axis].min_value;
+      Serial.printf("  %s-Axis: Range=%.3fg\n", axis_stats[axis].name, range);
+
+      if (range > best_range) {
+        best_range = range;
+        best_axis = axis;
+      }
+    }
+
+    selected_axis = (Axis)best_axis;
+    axis_detection_complete = true;
+    fft_sample_count = 0;
+
+    Serial.printf("Selected Axis: %s (Range: %.3fg)\n",
+                  axis_stats[selected_axis].name, best_range);
+    return;
+  }
+
+  // Phase 2: Sample collection for ALL 3 axes simultaneously
+  if (fft_sample_count == 0) {
+    Serial.println("Starting 3-axis sample collection...");
+    collection_start_time = millis();
+
+    // Collect ALL samples for all axes in one tight loop
+    for (int i = 0; i < MEASURE_FFT_SIZE; i++) {
+      unsigned long sample_start = micros();
+
+      StickCP2.Imu.update();
+      auto data = StickCP2.Imu.getImuData();
+
+      // Store samples for all three axes
+      measure_buffers[0][i] = (data.accel.x - Xzero) * Xfactor;
+      measure_buffers[1][i] = (data.accel.y - Yzero) * Yfactor;
+      measure_buffers[2][i] = (data.accel.z - Zzero) * Zfactor;
+
+      while ((micros() - sample_start) < sampling_period_us) {
+        /* tight timing loop */
+      }
+    }
+
+    fft_sample_count = MEASURE_FFT_SIZE;
+    unsigned long collection_time = millis() - collection_start_time;
+    Serial.printf("Sample collection complete in %lu ms\n", collection_time);
+    return;
+  }
+
+  // Phase 3: Perform FFT analysis - frequency from strongest axis, amplitude for all axes
+  if (fft_sample_count >= MEASURE_FFT_SIZE) {
+    Serial.println("Performing unified FFT analysis...");
+    unsigned long fft_start = millis();
+
+    // Step 1: Get frequency AND amplitude from strongest axis using combined FFT
+    FFTResult primary_result = performCombinedFFT(measure_buffers[selected_axis], MEASURE_FFT_SIZE);
+    float detected_freq = primary_result.frequency;
+    float primary_amplitude = primary_result.amplitude;
+
+    // Validate frequency
+    if (primary_amplitude < 0.1) {
+      outputFreq = 0.0;
+      Serial.printf("Weak signal (%.3f g), frequency rejected\n", primary_amplitude);
+    } else if (detected_freq < 1.0 || detected_freq > 60.0) {
+      outputFreq = 0.0;
+      Serial.printf("Frequency %.2f Hz out of range, rejected\n", detected_freq);
+    } else {
+      outputFreq = detected_freq;
+    }
+
+    // Step 2: Calculate amplitude for all 3 axes at the detected frequency
+    float amplitudes[3];
+    float median_amplitudes[3];
+    const char *axis_names[] = { "X", "Y", "Z" };
+
+    for (int axis = 0; axis < 3; axis++) {
+      if (axis == selected_axis) {
+        // Use amplitude from combined FFT (already calculated)
+        amplitudes[axis] = primary_amplitude;
+      } else if (outputFreq >= 1.0) {
+        // Calculate amplitude at detected frequency for other axes
+        amplitudes[axis] = calculateAmplitudeAtFrequency(measure_buffers[axis], MEASURE_FFT_SIZE, outputFreq);
+      } else {
+        // No valid frequency - use peak search fallback
+        amplitudes[axis] = calculateFFTAmplitude(measure_buffers[axis], MEASURE_FFT_SIZE);
+      }
+
+      median_amplitudes[axis] = MedianAmplitude(amplitudes[axis], axis);
+      Serial.printf("%s-axis: %.3f g (median: %.3f g)\n",
+                    axis_names[axis], amplitudes[axis], median_amplitudes[axis]);
+    }
+
+    // Store results
+    outputAmpX = median_amplitudes[0];
+    outputAmpY = median_amplitudes[1];
+    outputAmpZ = median_amplitudes[2];
+
+    unsigned long fft_time = millis() - fft_start;
+    Serial.printf("Unified FFT complete in %lu ms - Freq: %.2f Hz (%.0f RPM)\n",
+                  fft_time, outputFreq, outputFreq * 60.0);
+
+    // Reset for next collection cycle
+    fft_sample_count = 0;
+  }
+
+  // Update display and LED when not collecting samples
+  if (fft_sample_count == 0) {
+    static unsigned long last_display_update = 0;
+    if (millis() - last_display_update > 1000) {
+      refreshDisplay();
+      last_display_update = millis();
+    }
+
+    digitalWrite(ledPin, HIGH);
+    delayMicroseconds(10000);
+    digitalWrite(ledPin, LOW);
+  }
+}
+
+void refreshDisplay(void) {
+  // Display device number using array lookup
+  if (deviceNumber < 4) {
+    StickCP2.Display.pushImage(145, 0, 95, 85, DEVICE_IMAGES[deviceNumber]);
+  }
+
+  updateBatteryStatus();
+  displayBatteryIcon();
+  displayConnectionStatus();
+}
+
+void updateBatteryStatus(void) {
+  // Update battery readings
+  BatLevel = StickCP2.Power.getBatteryLevel();
+  RaBatLvl.addValue(BatLevel);
+  BatLvlAvg = RaBatLvl.getAverage();
+
+  VBat = StickCP2.Power.getBatteryVoltage();
+  RaVBat.addValue(VBat);
+  VBatAvg = RaVBat.getAverage();
+
+  // Primary detection: Check for sudden voltage jumps
+  int voltageJump = VBat - prevVBat;
+
+  if (abs(voltageJump) > VOLTAGE_JUMP_THRESHOLD) {
+    if (voltageJump > 0 && !isCharging) {
+      // Sudden increase - plugged in
+      isCharging = true;
+      Serial.printf("Battery: Charging detected (voltage jump +%dmV)\n", voltageJump);
+    } else if (voltageJump < 0 && isCharging) {
+      // Sudden decrease - unplugged
+      isCharging = false;
+      autoOff = 60000;
+      updateBatTime = millis();
+      disconnectTime = millis();  // Fix: Update disconnectTime
+      Serial.printf("Battery: Discharging detected (voltage jump %dmV)\n", voltageJump);
+    }
+  }
+
+  // Secondary detection: Simple moving average trend (for gradual changes)
+  // Check if average voltage is consistently rising or falling
+  if (VBatAvg > prevVBatAvg1 && prevVBatAvg1 > prevVBatAvg2 && prevVBatAvg2 > prevVBatAvg3) {
+    // Consistently rising = charging
+    if (!isCharging) {
+      isCharging = true;
+      Serial.println("Battery: Charging detected from rising average");
+    }
+  } else if (VBatAvg < prevVBatAvg1 && prevVBatAvg1 < prevVBatAvg2) {
+    // Consistently falling = unplugged
+    if (isCharging) {
+      isCharging = false;
+      autoOff = 60000;
+      updateBatTime = millis();
+      disconnectTime = millis();  // Fix: Update disconnectTime
+      Serial.println("Battery: Unplugged detected from falling average");
+    }
+  }
+
+  // Update history for next time
+  prevVBatAvg3 = prevVBatAvg2;
+  prevVBatAvg2 = prevVBatAvg1;
+  prevVBatAvg1 = VBatAvg;
+  prevVBat = VBat;
+}
+
+
+void displayBatteryIcon(void) {
+  if (isCharging) {
+    displayChargingBattery();
+  } else {
+    displayDischargingBattery();
+  }
+}
+
+void displayChargingBattery(void) {
+  disconnectTime = millis();  // Reset auto-off timer
+
+  if (VBat >= BATTERY_VOLTAGE_FULL) {
+    // Battery full - solid icon
+    autoOff = 60000;
+    StickCP2.Display.pushImage(145, 85, 95, 50, BatteryFull);
+  } else {
+    // Charging animation - alternate between icons
+    const uint16_t *icon1 = (VBat < BATTERY_VOLTAGE_LOW) ? BatteryHalf : BatteryFull;
+    const uint16_t *icon2 = (VBat < BATTERY_VOLTAGE_LOW) ? BatteryEmpty : BatteryHalf;
+
+    StickCP2.Display.pushImage(145, 85, 95, 50, batIcon == 0 ? icon1 : icon2);
+    batIcon = 1 - batIcon;  // Toggle between 0 and 1
+  }
+}
+
+void displayDischargingBattery(void) {
+  // Select battery icon based on level
+  const uint16_t *batteryIcon;
+  if (BatLvlAvg > BATTERY_LEVEL_MID) {
+    batteryIcon = BatteryFull;
+  } else if (BatLvlAvg > BATTERY_LEVEL_LOW) {
+    batteryIcon = BatteryHalf;
+  } else {
+    batteryIcon = BatteryEmpty;
+  }
+
+  StickCP2.Display.pushImage(145, 85, 95, 50, batteryIcon);
+
+  // Display battery percentage
+  if (BatLvlAvg < 100 && millis() - updateBatTime > updateBatInterval) {
+    StickCP2.Display.setTextColor(WHITE);
+    StickCP2.Display.setFont(&fonts::FreeSansBold9pt7b);
+    StickCP2.Display.setCursor(175, 97);
+    StickCP2.Display.printf("%3d%%", BatLvlAvg);
+  }
+}
+
+void displayConnectionStatus(void) {
+  BLEDevice central = BLE.central();
+
+  if (central.connected()) {
+    StickCP2.Display.pushImage(100, 0, 40, 75, Bluetooth);
+    StickCP2.Display.setTextColor(WHITE);
+    StickCP2.Display.setFont(&fonts::FreeSansBold9pt7b);
+    StickCP2.Display.setCursor(80, 23);
+
+    // Display mode indicator
+    StickCP2.Display.printf("%c", (Modus == 0) ? 'F' : 'A');
+  } else {
+    StickCP2.Display.pushImage(0, 0, 145, 135, Arrows);
+  }
+}
