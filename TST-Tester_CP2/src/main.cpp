@@ -57,6 +57,7 @@ bool prevDeviceConnected = false;
 // FFT Configuration
 #define SAMPLING_FREQ 500.0
 #define FFT_SIZE 1024
+#define HOP_SIZE 256  // New samples collected per cycle (75% overlap → ~0.5 s update rate)
 
 // Amplitude filtering configuration
 #define MAX_REASONABLE_AMPLITUDE 8.0  // Maximum physically reasonable amplitude in g
@@ -748,29 +749,57 @@ void loop()
 
 bool MeasureAll(void)
 {
-  static bool collection_complete = false;
+  static bool buffer_primed = false;
+  static int priming_pos = 0;
   static unsigned long collection_start = 0;
 
-  // Phase 1: Collect FFT_SIZE samples on all 3 axes simultaneously
-  if (!collection_complete)
+  collection_start = millis();
+
+  if (!buffer_primed)
   {
-    collection_start = millis();
-    for (int i = 0; i < FFT_SIZE; i++)
+    // Fill buffer incrementally HOP_SIZE samples at a time until FFT_SIZE is reached
+    int to_collect = min(HOP_SIZE, FFT_SIZE - priming_pos);
+    for (int i = 0; i < to_collect; i++)
     {
       unsigned long newTime = micros();
       M5.Imu.update();
       auto data = M5.Imu.getImuData();
-      measure_buffers[0][i] = (data.accel.x - Xzero) * Xfactor;
-      measure_buffers[1][i] = (data.accel.y - Yzero) * Yfactor;
-      measure_buffers[2][i] = (data.accel.z - Zzero) * Zfactor;
-      while ((micros() - newTime) < sampling_period_us) { /* chill */ }
+      measure_buffers[0][priming_pos + i] = (data.accel.x - Xzero) * Xfactor;
+      measure_buffers[1][priming_pos + i] = (data.accel.y - Yzero) * Yfactor;
+      measure_buffers[2][priming_pos + i] = (data.accel.z - Zzero) * Zfactor;
+      while ((micros() - newTime) < sampling_period_us) {}
     }
-    collection_complete = true;
-    Serial.printf("Collection: %lu ms\n", millis() - collection_start);
-    return false;
+    priming_pos += to_collect;
+    Serial.printf("Priming: %d/%d samples (%lu ms)\n", priming_pos, FFT_SIZE, millis() - collection_start);
+    if (priming_pos < FFT_SIZE)
+      return false;
+    buffer_primed = true;
+    // Fall through to run FFT on the now-full buffer
+  }
+  else
+  {
+    // Slide buffer left by HOP_SIZE, collect HOP_SIZE new samples at the end
+    for (int axis = 0; axis < 3; axis++)
+    {
+      memmove(measure_buffers[axis],
+              measure_buffers[axis] + HOP_SIZE,
+              (FFT_SIZE - HOP_SIZE) * sizeof(float));
+    }
+    for (int i = 0; i < HOP_SIZE; i++)
+    {
+      unsigned long newTime = micros();
+      M5.Imu.update();
+      auto data = M5.Imu.getImuData();
+      int idx = FFT_SIZE - HOP_SIZE + i;
+      measure_buffers[0][idx] = (data.accel.x - Xzero) * Xfactor;
+      measure_buffers[1][idx] = (data.accel.y - Yzero) * Yfactor;
+      measure_buffers[2][idx] = (data.accel.z - Zzero) * Zfactor;
+      while ((micros() - newTime) < sampling_period_us) {}
+    }
+    Serial.printf("Hop collection: %lu ms\n", millis() - collection_start);
   }
 
-  // Phase 2: Run amplitude FFT on all 3 axes, frequency FFT on best axis
+  // Run amplitude FFT on all 3 axes, frequency FFT on best axis
   float raw_amps[3];
   for (int axis = 0; axis < 3; axis++)
     raw_amps[axis] = calculateFFTAmplitude(measure_buffers[axis], FFT_SIZE);
@@ -802,7 +831,7 @@ bool MeasureAll(void)
     lastActivityTime = millis();
   }
 
-  Serial.printf("Freq: %.2f Hz (axis %d) | Amp X=%.3f Y=%.3f Z=%.3f | %lu ms\n",
+  Serial.printf("Freq: %.2f Hz (axis %d) | Amp X=%.3f Y=%.3f Z=%.3f | total %lu ms\n",
     outputFreq, best_axis, outputAmpX, outputAmpY, outputAmpZ, millis() - collection_start);
 
   refreshDisplay();
@@ -810,7 +839,6 @@ bool MeasureAll(void)
   delayMicroseconds(10000);
   digitalWrite(ledPin, LOW);
 
-  collection_complete = false;
   return true;
 }
 
