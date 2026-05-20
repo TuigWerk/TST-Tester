@@ -1,4 +1,4 @@
-#include <M5StickCPlus2.h>
+#include <M5Unified.h>
 #undef min // to fix issue: defining min() as this is vulnerable to the double evaluation problem and considered bad practice.
 #include <NimBLEDevice.h>
 #include "Arduino.h"
@@ -24,9 +24,10 @@ Preferences deviceSettings; // Separate namespace for device settings (read-writ
 
 const char *DEVICE_NAME[] = {"TST Sensor 1", "TST Sensor 2", "TST Sensor 3", "TST Sensor 4"};
 
-#define SOFTWARE_VERSION "v5.7 Unified"
+#define SOFTWARE_VERSION "v5.8 CP2"
 
 // Change Log:
+//  v5.8: Combined freq+amplitude pipeline; no mode switching, both characteristics always notified.
 //  v5.7: Set standard multiplication factor to 1.00 to solve 0 Hz values when device is not calibrated.
 //  v5.6: Device number stored in NVS, button release to change device number, auto-off when no vibration detected
 //  v5.5: NimBLE implementation for better BLE stability
@@ -47,22 +48,15 @@ NimBLECharacteristic *pFreqChar = nullptr;
 NimBLECharacteristic *pAmpxChar = nullptr;
 NimBLECharacteristic *pAmpyChar = nullptr;
 NimBLECharacteristic *pAmpzChar = nullptr;
-NimBLECharacteristic *pModeChar = nullptr;
+NimBLECharacteristic *pModeChar = nullptr; // stub for app backward compatibility
 NimBLEAdvertising *pAdvertising = nullptr;
 
 bool deviceConnected = false;
 bool prevDeviceConnected = false;
-uint8_t prevModus = 255; // Track mode changes
 
 // FFT Configuration
 #define SAMPLING_FREQ 500.0
-#define FFT_SIZE 1024              // Fixed sample size
-#define AXIS_DETECTION_SAMPLES 200 // 0.4 seconds at 500Hz
-#define MEASURE_FFT_SIZE 1024      // For amplitude measurement
-
-// Simplified FFT variables
-bool axis_detection_complete = false;
-int fft_sample_count = 0;
+#define FFT_SIZE 1024
 
 // Amplitude filtering configuration
 #define MAX_REASONABLE_AMPLITUDE 8.0  // Maximum physically reasonable amplitude in g
@@ -81,31 +75,8 @@ const uint8_t BRIGHTNESS_FULL = 128;
 const uint8_t BRIGHTNESS_DIM = 2;
 const unsigned long DIM_TIMEOUT = 30000; // Dim after 30 seconds of inactivity
 
-// Axis detection
-enum Axis
-{
-  X_AXIS = 0,
-  Y_AXIS = 1,
-  Z_AXIS = 2
-};
-
-struct AxisStats
-{
-  float max_value;
-  float min_value;
-  const char *name;
-};
-
-AxisStats axis_stats[3] = {
-    {-999, 999, "X"},
-    {-999, 999, "Y"},
-    {-999, 999, "Z"}};
-
-Axis selected_axis = X_AXIS;
-
-// Simplified sampling buffers
-float freq_buffer[FFT_SIZE];                // Single buffer for frequency detection
-float measure_buffers[3][MEASURE_FFT_SIZE]; // For amplitude measurement [axis][sample]
+// Sampling buffers — 3 axes, FFT_SIZE samples each
+float measure_buffers[3][FFT_SIZE];
 
 unsigned int sampling_period_us;
 
@@ -127,19 +98,13 @@ const uint16_t imageHeight = 135;
 
 int BatLevel;
 int BatLvlAvg;
-int BatLvlPrevious = 0; // Battery level from 1 min ago for charge detection
+int BatLvlPrevious = 0;
 unsigned long chargeCheckTime = 0;
 const unsigned long CHARGE_CHECK_INTERVAL = 60000; // Compare battery level every minute
-
-float sampleFreq = 500;
 
 float Xzero, Yzero, Zzero;
 float Xfactor, Yfactor, Zfactor;
 
-unsigned long printTime;
-unsigned long printInterval = 750;
-unsigned long ledTime;
-unsigned long ledInterval = 2000;
 unsigned long pressTime;
 unsigned long debounceInterval = 200;
 unsigned long refreshTime;
@@ -147,9 +112,8 @@ unsigned long refreshInterval = 2000;
 unsigned long updateBatTime;
 unsigned long updateBatInterval = 5000;
 unsigned long batteryCheckTime = 0;
-const unsigned long BATTERY_CHECK_INTERVAL = 30000; // Check battery every 30 seconds
+const unsigned long BATTERY_CHECK_INTERVAL = 30000;
 unsigned long startupDelay = 5000;
-unsigned long connectTime;
 unsigned long lastActivityTime;
 unsigned long maxAutoOff = 300000; // Maximum auto-off time (5 minutes)
 unsigned long autoOff = maxAutoOff;
@@ -159,16 +123,13 @@ float outputFreq = 0.0;
 
 const int SpeakerTone = 4000;
 
-byte Modus = 0;
-byte wasConnected = 0;
 byte deviceNumber = 0; // Initialize to 0 (TST Sensor 1)
 bool buttonState = false;
 bool prevButtonState = false;
 bool isDimmed = false;
 
 // Function declarations
-void FindFreq(void);
-void Measure(void);
+bool MeasureAll(void);
 void refreshDisplay(void);
 void updateBatteryStatus(void);
 void displayBatteryIcon(void);
@@ -504,19 +465,6 @@ class ServerCallbacks : public NimBLEServerCallbacks
   }
 };
 
-// NimBLE Characteristic Callbacks for Mode
-class ModeCallbacks : public NimBLECharacteristicCallbacks
-{
-  void onWrite(NimBLECharacteristic *pCharacteristic)
-  {
-    std::string value = pCharacteristic->getValue();
-    if (value.length() > 0)
-    {
-      Modus = value[0];
-      Serial.printf("Mode changed to: %d\n", Modus);
-    }
-  }
-};
 
 void setup()
 {
@@ -540,7 +488,7 @@ void setup()
   Serial.printf("Loaded device number: %d (%s)\n", deviceNumber, DEVICE_NAME[deviceNumber]);
 
   auto cfg = M5.config();
-  StickCP2.begin(cfg);
+  M5.begin(cfg);
 
   // Increase IMU sample rate to 1kHz (SMPLRT_DIV = 0)
   Wire1.beginTransmission(0x68); // MPU6886 I2C address
@@ -549,11 +497,11 @@ void setup()
   Wire1.endTransmission();
   Serial.println("IMU sample rate set to 1kHz");
 
-  StickCP2.Display.setRotation(1);
-  StickCP2.Display.setTextColor(WHITE);
-  StickCP2.Display.setFont(&fonts::FreeSansBold9pt7b);
-  StickCP2.Display.setTextSize(1);
-  StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
+  M5.Display.setRotation(1);
+  M5.Display.setTextColor(WHITE);
+  M5.Display.setFont(&fonts::FreeSansBold9pt7b);
+  M5.Display.setTextSize(1);
+  M5.Display.setBrightness(BRIGHTNESS_FULL);
 
   pinMode(buttonPin, INPUT);
   prevButtonState = digitalRead(buttonPin); // Initialize to actual state to prevent false trigger on boot
@@ -592,14 +540,12 @@ void setup()
   pModeChar = pAccService->createCharacteristic(
       BLE_UUID_MODE,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-  pModeChar->setCallbacks(new ModeCallbacks());
 
   // Set initial values
   pFreqChar->setValue(outputFreq);
   pAmpxChar->setValue(outputAmpX);
   pAmpyChar->setValue(outputAmpY);
   pAmpzChar->setValue(outputAmpZ);
-  pModeChar->setValue(&Modus, 1);
 
   // Start service
   pAccService->start();
@@ -615,17 +561,17 @@ void setup()
   Serial.println(DEVICE_NAME[deviceNumber]);
   Serial.println("NimBLE initialized and advertising");
 
-  StickCP2.update();
-  StickCP2.Display.setSwapBytes(true);
-  StickCP2.Display.setRotation(3);
-  StickCP2.Display.pushImage(0, 0, imageWidth, imageHeight, TSTLogo);
-  StickCP2.Display.setTextDatum(TL_DATUM); // Top-left alignment
-  StickCP2.Display.setFont(&fonts::FreeSans9pt7b);
-  StickCP2.Display.drawString(SOFTWARE_VERSION, 120, 20);
+  M5.update();
+  M5.Display.setSwapBytes(true);
+  M5.Display.setRotation(3);
+  M5.Display.pushImage(0, 0, imageWidth, imageHeight, TSTLogo);
+  M5.Display.setTextDatum(TL_DATUM); // Top-left alignment
+  M5.Display.setFont(&fonts::FreeSans9pt7b);
+  M5.Display.drawString(SOFTWARE_VERSION, 120, 20);
   delay(3000);
 
-  StickCP2.Display.fillScreen(BLACK);
-  StickCP2.Display.pushImage(0, 0, 145, 135, Arrows);
+  M5.Display.fillScreen(BLACK);
+  M5.Display.pushImage(0, 0, 145, 135, Arrows);
   refreshDisplay();
 
   // Clear amplitude filters
@@ -633,10 +579,10 @@ void setup()
   ampY_median.clear();
   ampZ_median.clear();
 
-  BatLevel = StickCP2.Power.getBatteryLevel();
+  BatLevel = M5.Power.getBatteryLevel();
   RaBatLvl.fillValue(BatLevel, 10);
-  BatLvlAvg = BatLevel;      // Initialize average for display
-  BatLvlPrevious = BatLevel; // Initialize for charge detection
+  BatLvlAvg = BatLevel;
+  BatLvlPrevious = BatLevel;
   chargeCheckTime = millis();
   batteryCheckTime = millis();
 
@@ -661,26 +607,14 @@ void setup()
   Serial.println();
   Serial.println();
 
-  // Simple FFT initialization
-  axis_detection_complete = false;
-  fft_sample_count = 0;
-
-  Serial.printf("FFT initialized: %d samples at %.0f Hz (%.2f Hz resolution)\n",
+  Serial.printf("FFT: %d samples at %.0f Hz, %.2f Hz resolution\n",
                 FFT_SIZE, SAMPLING_FREQ, SAMPLING_FREQ / FFT_SIZE);
-
-  float test_signal[MEASURE_FFT_SIZE];
-  for (int i = 0; i < MEASURE_FFT_SIZE; i++)
-  {
-    test_signal[i] = 2.0 * sin(2.0 * PI * 10.0 * i / 500.0); // 2g amplitude at 10Hz
-  }
-  float test_amplitude = calculateFFTAmplitude(test_signal, MEASURE_FFT_SIZE);
-  Serial.printf("Test signal amplitude: Expected=2.0g, Measured=%.3fg\n", test_amplitude);
 }
 
 void loop()
 {
-  StickCP2.update();
-  StickCP2.Imu.update();
+  M5.update();
+  M5.Imu.update();
 
   // Handle button release for device number change (not press, to avoid changing when turning off)
   if (millis() - pressTime > debounceInterval)
@@ -691,12 +625,13 @@ void loop()
       if (buttonState == true && prevButtonState == false && millis() > startupDelay)
       {
         // Button released - reset activity timer to brighten display
+        pressTime = millis(); // debounce: ignore re-triggers for 200ms after release
         lastActivityTime = millis();
 
         // Only change device number when not connected via BLE
         if (!deviceConnected)
         {
-          StickCP2.Speaker.tone(SpeakerTone, 50);
+          M5.Speaker.tone(SpeakerTone, 50);
           if (deviceNumber < 3)
           {
             deviceNumber++;
@@ -724,7 +659,6 @@ void loop()
           pAmpyChar = pAccService->createCharacteristic(BLE_UUID_AMPY, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
           pAmpzChar = pAccService->createCharacteristic(BLE_UUID_AMPZ, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
           pModeChar = pAccService->createCharacteristic(BLE_UUID_MODE, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-          pModeChar->setCallbacks(new ModeCallbacks());
           pAccService->start();
           pAdvertising = NimBLEDevice::getAdvertising();
           pAdvertising->addServiceUUID(BLE_UUID_ACC_SERVICE);
@@ -759,7 +693,7 @@ void loop()
   {
     if (!isDimmed)
     {
-      StickCP2.Display.setBrightness(BRIGHTNESS_DIM);
+      M5.Display.setBrightness(BRIGHTNESS_DIM);
       isDimmed = true;
     }
   }
@@ -767,7 +701,7 @@ void loop()
   {
     if (isDimmed)
     {
-      StickCP2.Display.setBrightness(BRIGHTNESS_FULL);
+      M5.Display.setBrightness(BRIGHTNESS_FULL);
       isDimmed = false;
     }
   }
@@ -775,358 +709,109 @@ void loop()
   // Handle connection state changes
   if (deviceConnected && !prevDeviceConnected)
   {
-    // Just connected
-    connectTime = millis();
     prevDeviceConnected = true;
-    StickCP2.Display.pushImage(0, 0, 145, 135, Arrows);
-    StickCP2.Display.pushImage(100, 0, 40, 75, Bluetooth);
-    Serial.println("Device connected - ready for commands");
+    M5.Display.pushImage(0, 0, 145, 135, Arrows);
+    M5.Display.pushImage(100, 0, 40, 75, Bluetooth);
+    Serial.println("Device connected");
   }
 
   if (!deviceConnected && prevDeviceConnected)
   {
-    // Just disconnected
     prevDeviceConnected = false;
-    Modus = 0;
-    prevModus = 255;
-    wasConnected = 1;
     autoOff = 120000; // 2 minutes after BLE disconnect
     lastActivityTime = millis();
     Serial.println("Device disconnected");
   }
 
-  // Handle mode changes
-  if (deviceConnected && Modus != prevModus)
-  {
-    prevModus = Modus;
-    StickCP2.Display.pushImage(0, 0, 145, 135, Arrows);
-    StickCP2.Display.pushImage(100, 0, 40, 75, Bluetooth);
-
-    // Reset FFT state when mode changes
-    axis_detection_complete = false;
-    fft_sample_count = 0;
-
-    // Reset axis stats
-    for (int i = 0; i < 3; i++)
-    {
-      axis_stats[i].max_value = -999;
-      axis_stats[i].min_value = 999;
-    }
-
-    // Clear amplitude filters
-    ampX_median.clear();
-    ampY_median.clear();
-    ampZ_median.clear();
-
-    Serial.printf("Mode changed to %d - FFT state reset\n", Modus);
-  }
-
   // Main measurement loop when connected
   if (deviceConnected)
   {
-    wasConnected = 1;
-
-    if (millis() - connectTime >= startupDelay)
+    if (MeasureAll())
     {
-      if (Modus == 0)
-      {
-        FindFreq();
-        // Send frequency data
-        pFreqChar->setValue(outputFreq);
-        pFreqChar->notify();
-        pAmpxChar->setValue(outputAmpX);
-        pAmpxChar->notify();
-        pAmpyChar->setValue(outputAmpY);
-        pAmpyChar->notify();
-        pAmpzChar->setValue(outputAmpZ);
-        pAmpzChar->notify();
-        // pAmpxChar->setValue(0.0f);
-        // pAmpyChar->setValue(0.0f);
-        // pAmpzChar->setValue(0.0f);
-      }
-      else
-      {
-        Measure();
-        if (millis() - printTime >= printInterval)
-        {
-          printTime = millis();
-          // Send amplitude data
-          // pFreqChar->setValue(outputFreq);
-          // pFreqChar->notify();
-          pAmpxChar->setValue(outputAmpX);
-          pAmpxChar->notify();
-          pAmpyChar->setValue(outputAmpY);
-          pAmpyChar->notify();
-          pAmpzChar->setValue(outputAmpZ);
-          pAmpzChar->notify();
-        }
-        if (millis() - ledTime >= ledInterval)
-        {
-          digitalWrite(ledPin, HIGH);
-          delay(20);
-          digitalWrite(ledPin, LOW);
-          ledTime = millis();
-        }
-        if (millis() - refreshTime >= refreshInterval)
-        {
-          refreshTime = millis();
-          refreshDisplay();
-        }
-      }
+      pFreqChar->setValue(outputFreq);
+      pFreqChar->notify();
+      pAmpxChar->setValue(outputAmpX);
+      pAmpxChar->notify();
+      pAmpyChar->setValue(outputAmpY);
+      pAmpyChar->notify();
+      pAmpzChar->setValue(outputAmpZ);
+      pAmpzChar->notify();
     }
   }
 
   // Auto power off (timeout varies by state: 5min default, 2min after BLE, 1min when full)
   if (millis() - lastActivityTime > autoOff)
   {
-    StickCP2.Power.powerOff();
+    M5.Power.powerOff();
   }
 }
 
-// SIMPLIFIED FINDFREQ FUNCTION - Fixed timing issues!
-void FindFreq(void)
-{
-  static unsigned long collection_start_time = 0;
-
-  // Phase 1: Axis Detection (run once)
-  if (!axis_detection_complete)
-  {
-    Serial.println("Starting axis detection...");
-
-    // Collect samples rapidly for axis detection
-    for (int i = 0; i < AXIS_DETECTION_SAMPLES; i++)
-    {
-      unsigned long newTime = micros();
-      StickCP2.Imu.update();
-      auto data = StickCP2.Imu.getImuData();
-
-      float samples[3] = {
-          (data.accel.x - Xzero) * Xfactor,
-          (data.accel.y - Yzero) * Yfactor,
-          (data.accel.z - Zzero) * Zfactor};
-
-      // Update axis statistics
-      for (int axis = 0; axis < 3; axis++)
-      {
-        float value = samples[axis];
-        if (value > axis_stats[axis].max_value)
-        {
-          axis_stats[axis].max_value = value;
-        }
-        if (value < axis_stats[axis].min_value)
-        {
-          axis_stats[axis].min_value = value;
-        }
-      }
-
-      // More precise timing - wait for exact interval
-      while ((micros() - newTime) < sampling_period_us)
-      {
-        /* chill */
-      }
-    }
-
-    // Select axis with highest range
-    float best_range = 0;
-    int best_axis = 0;
-
-    Serial.println("Axis Detection Complete:");
-    for (int axis = 0; axis < 3; axis++)
-    {
-      float range = axis_stats[axis].max_value - axis_stats[axis].min_value;
-      Serial.printf("  %s-Axis: Range=%.3fg\n", axis_stats[axis].name, range);
-
-      if (range > best_range)
-      {
-        best_range = range;
-        best_axis = axis;
-      }
-    }
-
-    selected_axis = (Axis)best_axis;
-    axis_detection_complete = true;
-    fft_sample_count = 0;
-    collection_start_time = millis(); // Start timing collection phase
-
-    Serial.printf("Selected Axis: %s (Range: %.3fg)\n",
-                  axis_stats[selected_axis].name, best_range);
-    Serial.printf("Starting FFT collection: %d samples at %.0f Hz (should take %.1f seconds)\n",
-                  FFT_SIZE, SAMPLING_FREQ, FFT_SIZE / SAMPLING_FREQ);
-    return; // Exit early during axis detection
-  }
-
-  // Phase 2: Fast sample collection in tight loop
-  if (fft_sample_count == 0)
-  {
-    Serial.println("Starting fast sample collection...");
-    collection_start_time = millis();
-
-    // Collect ALL samples in one tight loop for best timing
-    for (int i = 0; i < FFT_SIZE; i++)
-    {
-      unsigned long sample_start = micros();
-
-      StickCP2.Imu.update();
-      auto data = StickCP2.Imu.getImuData();
-
-      float selected_sample;
-      switch (selected_axis)
-      {
-      case X_AXIS:
-        selected_sample = (data.accel.x - Xzero) * Xfactor;
-        break;
-      case Y_AXIS:
-        selected_sample = (data.accel.y - Yzero) * Yfactor;
-        break;
-      case Z_AXIS:
-        selected_sample = (data.accel.z - Zzero) * Zfactor;
-        break;
-      }
-
-      freq_buffer[i] = selected_sample;
-
-      // Precise timing - wait for exact 2ms interval (500Hz)
-      while ((micros() - sample_start) < sampling_period_us)
-      {
-        /* tight timing loop */
-      }
-    }
-
-    fft_sample_count = FFT_SIZE; // Mark collection complete
-    unsigned long collection_time = millis() - collection_start_time;
-    Serial.printf("Sample collection complete in %lu ms (expected: %.0f ms)\n",
-                  collection_time, (FFT_SIZE * 1000.0) / SAMPLING_FREQ);
-    return; // Exit to perform FFT on next call
-  }
-
-  // Phase 3: Perform FFT when buffer is full
-  if (fft_sample_count >= FFT_SIZE)
-  {
-    Serial.printf("Performing FFT on %d samples...\n", FFT_SIZE);
-
-    unsigned long fft_start = millis();
-    float detected_freq = performFFTAnalysis(freq_buffer, FFT_SIZE);
-    unsigned long fft_time = millis() - fft_start;
-
-    // Get amplitude for the detected frequency to determine if signal is real
-    float fft_amplitude = calculateFFTAmplitude(freq_buffer, FFT_SIZE);
-
-    // Amplitude-based filtering: only output frequency if signal is strong enough
-    if (fft_amplitude < 0.1)
-    {
-      outputFreq = 0.0; // Too weak = likely noise, output 0 Hz
-      Serial.printf("Weak signal (%.3f g), frequency rejected\n", fft_amplitude);
-    }
-    else if (detected_freq < 1.0 || detected_freq > 60.0)
-    {
-      outputFreq = 0.0; // Keep basic range check for obviously wrong frequencies
-      Serial.printf("Frequency %.2f Hz out of range (1-60 Hz), rejected\n", detected_freq);
-    }
-    else
-    {
-      outputFreq = detected_freq;  // Strong signal in valid range = accept
-      autoOff = maxAutoOff;        // Extend timeout to maxAutoOff minutes when vibration detected
-      lastActivityTime = millis(); // Reset auto-off timer
-      Serial.printf("Strong signal (%.3f g), frequency: %.2f Hz accepted\n", fft_amplitude, outputFreq);
-    }
-
-    Serial.printf("FFT complete in %lu ms - Raw: %.2f Hz, Output: %.2f Hz (%.0f RPM)\n",
-                  fft_time, detected_freq, outputFreq, outputFreq * 60.0);
-
-    // Reset for next collection cycle
-    fft_sample_count = 0;
-    collection_start_time = 0;
-  }
-
-  // Only update display and LED when not collecting samples
-  if (fft_sample_count == 0)
-  {
-    static unsigned long last_display_update = 0;
-    if (millis() - last_display_update > 1000)
-    { // Update display only once per second
-      refreshDisplay();
-      last_display_update = millis();
-    }
-
-    // Quick LED blink
-    digitalWrite(ledPin, HIGH);
-    delayMicroseconds(10000); // 10ms blink
-    digitalWrite(ledPin, LOW);
-  }
-}
-
-void Measure(void)
+bool MeasureAll(void)
 {
   static bool collection_complete = false;
-  static unsigned long last_measure_start = 0;
+  static unsigned long collection_start = 0;
 
-  // Phase 1: Collect ALL samples in one tight loop
+  // Phase 1: Collect FFT_SIZE samples on all 3 axes simultaneously
   if (!collection_complete)
   {
-    last_measure_start = millis();
-    Serial.println("Starting simultaneous 3-axis measurement...");
-
-    // Collect ALL samples in one uninterrupted loop
-    for (int i = 0; i < MEASURE_FFT_SIZE; i++)
+    collection_start = millis();
+    for (int i = 0; i < FFT_SIZE; i++)
     {
       unsigned long newTime = micros();
-      StickCP2.Imu.update();
-      auto data = StickCP2.Imu.getImuData();
-
-      // Store samples for all three axes simultaneously
-      measure_buffers[0][i] = (data.accel.x - Xzero) * Xfactor; // X-axis
-      measure_buffers[1][i] = (data.accel.y - Yzero) * Yfactor; // Y-axis
-      measure_buffers[2][i] = (data.accel.z - Zzero) * Zfactor; // Z-axis
-
-      // Wait for precise timing
-      while ((micros() - newTime) < sampling_period_us)
-      {
-        /* chill */
-      }
+      M5.Imu.update();
+      auto data = M5.Imu.getImuData();
+      measure_buffers[0][i] = (data.accel.x - Xzero) * Xfactor;
+      measure_buffers[1][i] = (data.accel.y - Yzero) * Yfactor;
+      measure_buffers[2][i] = (data.accel.z - Zzero) * Zfactor;
+      while ((micros() - newTime) < sampling_period_us) { /* chill */ }
     }
-
     collection_complete = true;
-    unsigned long collection_time = millis() - last_measure_start;
-    Serial.printf("Sample collection complete in %lu ms. Performing 3 FFTs...\n", collection_time);
-    return;
+    Serial.printf("Collection: %lu ms\n", millis() - collection_start);
+    return false;
   }
 
-  // Phase 2: Process FFTs and output raw data for Serial Plotter
-  if (collection_complete)
+  // Phase 2: Run amplitude FFT on all 3 axes, frequency FFT on best axis
+  float raw_amps[3];
+  for (int axis = 0; axis < 3; axis++)
+    raw_amps[axis] = calculateFFTAmplitude(measure_buffers[axis], FFT_SIZE);
+
+  int best_axis = 0;
+  for (int i = 1; i < 3; i++)
+    if (raw_amps[i] > raw_amps[best_axis]) best_axis = i;
+
+  float detected_freq = performFFTAnalysis(measure_buffers[best_axis], FFT_SIZE);
+
+  if (raw_amps[best_axis] >= 0.1 && detected_freq >= lowestFreq && detected_freq <= highestFreq)
   {
-
-    // Continue with normal FFT processing
-    float amplitudes[3];
-    float median_amplitudes[3];
-    const char *axis_names[] = {"X", "Y", "Z"};
-
-    for (int axis = 0; axis < 3; axis++)
-    {
-      amplitudes[axis] = calculateFFTAmplitude(measure_buffers[axis], MEASURE_FFT_SIZE);
-      median_amplitudes[axis] = MedianAmplitude(amplitudes[axis], axis);
-
-      Serial.printf("%s-axis: raw= %.3f g, median= %.3f g\n",
-                    axis_names[axis], amplitudes[axis], median_amplitudes[axis]);
-    }
-
-    // Update amplitude values
-    outputAmpX = median_amplitudes[0];
-    outputAmpY = median_amplitudes[1];
-    outputAmpZ = median_amplitudes[2];
-
-    // Reset auto-off timer when significant vibration detected on any axis
-    if (outputAmpX > 0.1 || outputAmpY > 0.1 || outputAmpZ > 0.1)
-    {
-      autoOff = maxAutoOff; // Extend timeout to maxAutoOff minutes when vibration detected
-      lastActivityTime = millis();
-    }
-
-    unsigned long total_time = millis() - last_measure_start;
-    Serial.printf("Complete 3-axis measurement cycle: %lu ms\n", total_time);
-    Serial.println("----");
-
-    collection_complete = false;
+    outputFreq = detected_freq;
+    autoOff = maxAutoOff;
+    lastActivityTime = millis();
   }
+  else
+  {
+    outputFreq = 0.0;
+  }
+
+  outputAmpX = MedianAmplitude(raw_amps[0], 0);
+  outputAmpY = MedianAmplitude(raw_amps[1], 1);
+  outputAmpZ = MedianAmplitude(raw_amps[2], 2);
+
+  if (outputAmpX > 0.1 || outputAmpY > 0.1 || outputAmpZ > 0.1)
+  {
+    autoOff = maxAutoOff;
+    lastActivityTime = millis();
+  }
+
+  Serial.printf("Freq: %.2f Hz (axis %d) | Amp X=%.3f Y=%.3f Z=%.3f | %lu ms\n",
+    outputFreq, best_axis, outputAmpX, outputAmpY, outputAmpZ, millis() - collection_start);
+
+  refreshDisplay();
+  digitalWrite(ledPin, HIGH);
+  delayMicroseconds(10000);
+  digitalWrite(ledPin, LOW);
+
+  collection_complete = false;
+  return true;
 }
 
 void refreshDisplay(void)
@@ -1134,7 +819,7 @@ void refreshDisplay(void)
   // Display device number using array lookup
   if (deviceNumber < 4)
   {
-    StickCP2.Display.pushImage(145, 0, 95, 85, DEVICE_IMAGES[deviceNumber]);
+    M5.Display.pushImage(145, 0, 95, 85, DEVICE_IMAGES[deviceNumber]);
   }
 
   displayBatteryIcon();
@@ -1144,7 +829,7 @@ void refreshDisplay(void)
 void updateBatteryStatus(void)
 {
   // Update battery readings
-  BatLevel = StickCP2.Power.getBatteryLevel();
+  BatLevel = M5.Power.getBatteryLevel();
   RaBatLvl.addValue(BatLevel);
   BatLvlAvg = RaBatLvl.getAverage();
 
@@ -1179,15 +864,15 @@ void displayBatteryIcon(void)
     batteryIcon = BatteryEmpty;
   }
 
-  StickCP2.Display.pushImage(145, 85, 95, 50, batteryIcon);
+  M5.Display.pushImage(145, 85, 95, 50, batteryIcon);
 
   // Display battery percentage
   if (millis() - updateBatTime > updateBatInterval)
   {
-    StickCP2.Display.setTextColor(WHITE);
-    StickCP2.Display.setFont(&fonts::FreeSansBold9pt7b);
-    StickCP2.Display.setCursor(175, 97);
-    StickCP2.Display.printf("%3d%%", BatLvlAvg);
+    M5.Display.setTextColor(WHITE);
+    M5.Display.setFont(&fonts::FreeSansBold9pt7b);
+    M5.Display.setCursor(175, 97);
+    M5.Display.printf("%3d%%", BatLvlAvg);
   }
 }
 
@@ -1195,16 +880,10 @@ void displayConnectionStatus(void)
 {
   if (deviceConnected)
   {
-    StickCP2.Display.pushImage(100, 0, 40, 75, Bluetooth);
-    StickCP2.Display.setTextColor(WHITE);
-    StickCP2.Display.setFont(&fonts::FreeSansBold9pt7b);
-    StickCP2.Display.setCursor(80, 23);
-
-    // Display mode indicator
-    StickCP2.Display.printf("%c", (Modus == 0) ? 'F' : 'A');
+    M5.Display.pushImage(100, 0, 40, 75, Bluetooth);
   }
   else
   {
-    StickCP2.Display.pushImage(0, 0, 145, 135, Arrows);
+    M5.Display.pushImage(0, 0, 145, 135, Arrows);
   }
 }

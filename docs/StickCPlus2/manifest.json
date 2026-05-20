@@ -1,6 +1,6 @@
 {
-  "name": "TST Sensor StickC Plus 2",
-  "version": "1.0",
+  "name": "TST Sensor - CP2 (yellow)",
+  "version": "5.8",
   "new_install_prompt_erase": false,
   "builds": [
     {

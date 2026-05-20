@@ -1,5 +1,5 @@
 #undef min  // to fix issue: defining min() as this is vulnerable to the double evaluation problem and considered bad practice.
-#include <M5StickCPlus2.h>
+#include <M5Unified.h>
 #include "Arduino.h"
 #include <RunningAverage.h>
 #include <Preferences.h>
@@ -60,13 +60,13 @@ void setup() {
   pinMode(buttonPin, INPUT);
 
   auto cfg = M5.config();
-  StickCP2.begin(cfg);
-  StickCP2.update();
+  M5.begin(cfg);
+  M5.update();
 
-  StickCP2.Display.setRotation(3);
-  StickCP2.Display.setTextColor(WHITE);
-  StickCP2.Display.setTextSize(2);
-  StickCP2.Display.setFont(&fonts::FreeSansBold12pt7b);
+  M5.Display.setRotation(3);
+  M5.Display.setTextColor(WHITE);
+  M5.Display.setTextSize(2);
+  M5.Display.setFont(&fonts::FreeSansBold12pt7b);
 
   delay(2000);
   Serial.println("Starting....");
@@ -91,14 +91,14 @@ void setup() {
 }
 
 void loop() {
-  StickCP2.update();
+  M5.update();
 
   if (millis() - pressTime > debounceInterval) {  //wait a moment for debounce
     buttonState = digitalRead(buttonPin);         //check button state 1 or 0
     if (buttonState != prevButtonState) {         //compare with previous button state and act only if state has changed
       pressTime = millis();
       if (buttonState == false) {
-        StickCP2.Speaker.tone(4000, 50);
+        M5.Speaker.tone(4000, 50);
         if (menuIndex == 0) {
           Serial.println("X Min saved");
           MiMa[0] = Sav[0];
@@ -186,8 +186,8 @@ void loop() {
 
   if (millis() - lastReadTime >= readInterval) {
     lastReadTime = millis();
-    StickCP2.Imu.update();
-    auto data = StickCP2.Imu.getImuData();
+    M5.Imu.update();
+    auto data = M5.Imu.getImuData();
     accX = data.accel.x;
     accY = data.accel.y;
     accZ = data.accel.z;
@@ -212,32 +212,32 @@ void loop() {
       char axisChar = (menuIndex < 2) ? 'X' : (menuIndex < 4) ? 'Y' : 'Z';
       float displayVal = (menuIndex < 2) ? Sav[0] : (menuIndex < 4) ? Sav[1] : Sav[2];
 
-      StickCP2.Display.fillScreen(BLACK);
-      StickCP2.Display.setFont(&fonts::FreeSans9pt7b);
-      StickCP2.Display.setTextSize(1);
-      StickCP2.Display.setCursor(5, 18);
-      StickCP2.Display.printf("Step %d/6", menuIndex + 1);
-      StickCP2.Display.setCursor(5, 40);
-      StickCP2.Display.print(instructions[menuIndex]);
-      StickCP2.Display.setFont(&fonts::FreeSansBold12pt7b);
-      StickCP2.Display.setTextSize(2);
-      StickCP2.Display.setCursor(20, 100);
-      StickCP2.Display.printf("%c: %.2f", axisChar, displayVal);
+      M5.Display.fillScreen(BLACK);
+      M5.Display.setFont(&fonts::FreeSans9pt7b);
+      M5.Display.setTextSize(1);
+      M5.Display.setCursor(5, 18);
+      M5.Display.printf("Step %d/6", menuIndex + 1);
+      M5.Display.setCursor(5, 40);
+      M5.Display.print(instructions[menuIndex]);
+      M5.Display.setFont(&fonts::FreeSansBold12pt7b);
+      M5.Display.setTextSize(2);
+      M5.Display.setCursor(20, 100);
+      M5.Display.printf("%c: %.2f", axisChar, displayVal);
     }
     if (menuIndex == 6) {
-      StickCP2.Display.clear();
-      StickCP2.Display.setFont(&fonts::FreeSans9pt7b);
-      StickCP2.Display.setTextSize(1);
-      StickCP2.Display.setCursor(10, 18);
-      StickCP2.Display.print("Calibration Done!");
-      StickCP2.Display.setCursor(10, 45);
-      StickCP2.Display.printf("X: %.2f", Sav[0] - Xzero * Xfactor);
-      StickCP2.Display.setCursor(10, 68);
-      StickCP2.Display.printf("Y: %.2f", Sav[1] - Yzero * Yfactor);
-      StickCP2.Display.setCursor(10, 91);
-      StickCP2.Display.printf("Z: %.2f", Sav[2] - Zzero * Zfactor);
-      StickCP2.Display.setCursor(10, 120);
-      StickCP2.Display.print("Btn: restart");
+      M5.Display.clear();
+      M5.Display.setFont(&fonts::FreeSans9pt7b);
+      M5.Display.setTextSize(1);
+      M5.Display.setCursor(10, 18);
+      M5.Display.print("Calibration Done!");
+      M5.Display.setCursor(10, 45);
+      M5.Display.printf("X: %.2f", Sav[0] - Xzero * Xfactor);
+      M5.Display.setCursor(10, 68);
+      M5.Display.printf("Y: %.2f", Sav[1] - Yzero * Yfactor);
+      M5.Display.setCursor(10, 91);
+      M5.Display.printf("Z: %.2f", Sav[2] - Zzero * Zfactor);
+      M5.Display.setCursor(10, 120);
+      M5.Display.print("Btn: restart");
     }
   }
 }
