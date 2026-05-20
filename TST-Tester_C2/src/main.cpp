@@ -699,8 +699,8 @@ bool MeasureAll(void)
       unsigned long newTime = micros();
       M5.Imu.update();
       auto data = M5.Imu.getImuData();
-      measure_buffers[0][i] = (data.accel.x - Xzero) * Xfactor;
-      measure_buffers[1][i] = (data.accel.y - Yzero) * Yfactor;
+      measure_buffers[0][i] = (data.accel.y - Yzero) * Yfactor; // Note: MPU6886 axes are swapped compared to MPU6050, so Y is used for X and X for Y to fit the representation of the axes on the screen
+      measure_buffers[1][i] = (data.accel.x - Xzero) * Xfactor;
       measure_buffers[2][i] = (data.accel.z - Zzero) * Zfactor;
       while ((micros() - newTime) < sampling_period_us) { /* chill */ }
     }
