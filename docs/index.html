@@ -40,9 +40,9 @@
   <p class="subtitle">Connect your device via USB and click the button below.</p>
 
   <div class="device">
-    <h2>TST Sensor StickC Plus</h2>
-    <div class="version" id="version-cplus">Loading version...</div>
-    <esp-web-install-button manifest="StickCPlus/manifest.json"></esp-web-install-button>
+    <h2>TST Sensor - CP (dark orange)</h2>
+    <div class="version" id="version-cp">Loading version...</div>
+    <esp-web-install-button manifest="CP/manifest.json"></esp-web-install-button>
     <p class="instructions">
       Requires Google Chrome or Microsoft Edge.<br>
       Hold the side button while connecting USB if the device is not detected.
@@ -50,9 +50,19 @@
   </div>
 
   <div class="device">
-    <h2>TST Sensor StickC Plus 2</h2>
-    <div class="version" id="version-cplus2">Loading version...</div>
-    <esp-web-install-button manifest="StickCPlus2/manifest.json"></esp-web-install-button>
+    <h2>TST Sensor - CP2 (yellow)</h2>
+    <div class="version" id="version-cp2">Loading version...</div>
+    <esp-web-install-button manifest="CP2/manifest.json"></esp-web-install-button>
+    <p class="instructions">
+      Requires Google Chrome or Microsoft Edge.<br>
+      Hold the side button while connecting USB if the device is not detected.
+    </p>
+  </div>
+
+  <div class="device">
+    <h2>TST Sensor Core2</h2>
+    <div class="version" id="version-core2">Loading version...</div>
+    <esp-web-install-button manifest="Core2/manifest.json"></esp-web-install-button>
     <p class="instructions">
       Requires Google Chrome or Microsoft Edge.<br>
       Hold the side button while connecting USB if the device is not detected.
@@ -69,8 +79,9 @@
         document.getElementById(elementId).textContent = "";
       }
     }
-    loadVersion("StickCPlus/manifest.json", "version-cplus");
-    loadVersion("StickCPlus2/manifest.json", "version-cplus2");
+    loadVersion("CP/manifest.json", "version-cp");
+    loadVersion("CP2/manifest.json", "version-cp2");
+    loadVersion("Core2/manifest.json", "version-core2");
   </script>
 </body>
 </html>
