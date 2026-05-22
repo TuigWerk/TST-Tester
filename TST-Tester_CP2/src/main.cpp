@@ -73,7 +73,7 @@ const int BATTERY_LEVEL_LOW = 25;
 
 // Display brightness constants
 const uint8_t BRIGHTNESS_FULL = 128;
-const uint8_t BRIGHTNESS_DIM = 2;
+const uint8_t BRIGHTNESS_DIM = 1;
 const unsigned long DIM_TIMEOUT = 30000; // Dim after 30 seconds of inactivity
 
 // Sampling buffers — 3 axes, FFT_SIZE samples each
