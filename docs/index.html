@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TST Sensor Firmware Update</title>
+  <title>TST Sensor Firmware-Update</title>
   <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
   <style>
     body {
@@ -36,59 +36,59 @@
   </style>
 </head>
 <body>
-  <h1>TST Sensor Firmware Update</h1>
-  <p class="subtitle">Connect your device via USB and click the button below.</p>
+  <h1>TST Sensor Firmware-Update</h1>
+  <p class="subtitle">Gerät per USB verbinden und auf die Schaltfläche klicken.</p>
 
   <!-- <div class="device">
     <h2>TST Sensor - CPlus (dark orange)</h2>
-    <div class="version" id="version-cp">Loading version...</div>
+    <div class="version" id="version-cp">Version wird geladen...</div>
     <esp-web-install-button manifest="CP/manifest.json"></esp-web-install-button>
     <p class="instructions">
-      Requires Google Chrome or Microsoft Edge.<br>
-      The device must be switched on to be detected.
+      Erfordert Google Chrome oder Microsoft Edge.<br>
+      Das Gerät muss eingeschaltet sein, um erkannt zu werden.
     </p>
   </div> -->
 
   <div class="device">
-    <h2>TST Sensor - stable version with mode switching</h2>
-    <div class="version" id="version-cp2-alpha">Loading version...</div>
+    <h2>TST Sensor - stabile Version mit Moduswechsel</h2>
+    <div class="version" id="version-cp2-alpha">Version wird geladen...</div>
     <esp-web-install-button manifest="CP2-alpha/manifest.json"></esp-web-install-button>
     <p class="instructions">
-      Last version with frequency and amplitude mode switching. Use to downgrade if a newer version does not work.<br>
-      Requires Google Chrome or Microsoft Edge.<br>
-      The device must be switched on to be detected.
+      Letzte Version mit Frequenz- und Amplitudenmoduswechsel. Zum Downgrade verwenden, falls eine neuere Version nicht funktioniert.<br>
+      Erfordert Google Chrome oder Microsoft Edge.<br>
+      Das Gerät muss eingeschaltet sein, um erkannt zu werden.
     </p>
   </div>
 
   <!-- <div class="device">
     <h2>TST Sensor - CPlus2 (yellow)</h2>
-    <div class="version" id="version-cp2">Loading version...</div>
+    <div class="version" id="version-cp2">Version wird geladen...</div>
     <esp-web-install-button manifest="CP2/manifest.json"></esp-web-install-button>
     <p class="instructions">
-      Requires Google Chrome or Microsoft Edge.<br>
-      The device must be switched on to be detected.
+      Erfordert Google Chrome oder Microsoft Edge.<br>
+      Das Gerät muss eingeschaltet sein, um erkannt zu werden.
     </p>
   </div> -->
 
   <div class="device">
-    <h2>TST Sensor - beta version with simultaneous frequency and amplitude measurement</h2>
-    <div class="version" id="version-cp2-beta">Loading version...</div>
+    <h2>TST Sensor - Beta-Version mit gleichzeitiger Frequenz- und Amplitudenmessung</h2>
+    <div class="version" id="version-cp2-beta">Version wird geladen...</div>
     <esp-web-install-button manifest="CP2-beta/manifest.json"></esp-web-install-button>
     <p class="instructions">
-      Beta firmware for testing simultaneous frequency and amplitude measurement and faster update rate. <br> 
-      Flash stable version above to downgrade.<br>
-      Requires Google Chrome or Microsoft Edge.<br>
-      The device must be switched on to be detected.
+      Beta-Firmware zum Testen der gleichzeitigen Frequenz- und Amplitudenmessung sowie schnelleren Aktualisierungsrate.<br>
+      Zum Downgrade die stabile Version oben flashen.<br>
+      Erfordert Google Chrome oder Microsoft Edge.<br>
+      Das Gerät muss eingeschaltet sein, um erkannt zu werden.
     </p>
   </div>
 
   <!-- <div class="device">
     <h2>TST Sensor - Core2</h2>
-    <div class="version" id="version-core2">Loading version...</div>
+    <div class="version" id="version-core2">Version wird geladen...</div>
     <esp-web-install-button manifest="Core2/manifest.json"></esp-web-install-button>
     <p class="instructions">
       Requires Google Chrome or Microsoft Edge.<br>
-      Hold the side button while connecting USB if the device is not detected.
+      Seitentaste beim Verbinden gedrückt halten, falls das Gerät nicht erkannt wird.
     </p>
   </div> -->
 
@@ -97,7 +97,7 @@
       try {
         const res = await fetch(manifestPath);
         const data = await res.json();
-        document.getElementById(elementId).textContent = "Firmware v" + data.version;
+        document.getElementById(elementId).textContent = "Firmware-Version " + data.version;
       } catch {
         document.getElementById(elementId).textContent = "";
       }

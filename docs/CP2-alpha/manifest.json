@@ -1,6 +1,6 @@
 {
-  "name": "TST Sensor - CP2 (yellow) alpha",
-  "version": "5.7-alpha",
+  "name": "TST Sensor - stabile Version mit Moduswechsel",
+  "version": "5.7",
   "new_install_prompt_erase": false,
   "builds": [
     {

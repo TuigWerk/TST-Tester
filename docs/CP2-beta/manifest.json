@@ -1,6 +1,6 @@
 {
-  "name": "TST Sensor - CP2 (yellow) beta",
-  "version": "5.9-beta",
+  "name": "TST Sensor - Beta mit gleichzeitiger Frequenz- und Amplitudenmessung",
+  "version": "5.9",
   "new_install_prompt_erase": false,
   "builds": [
     {
