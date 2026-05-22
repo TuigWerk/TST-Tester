@@ -24,9 +24,10 @@ Preferences deviceSettings; // Separate namespace for device settings (read-writ
 
 const char *DEVICE_NAME[] = {"TST Sensor 1", "TST Sensor 2", "TST Sensor 3", "TST Sensor 4"};
 
-#define SOFTWARE_VERSION "v5.8 CP2"
+#define SOFTWARE_VERSION "v5.9 CP2"
 
 // Change Log:
+//  v5.9: Overlapping FFT windows (75% overlap, HOP_SIZE=256) for 4x faster amplitude response.
 //  v5.8: Combined freq+amplitude pipeline; no mode switching, both characteristics always notified.
 //  v5.7: Set standard multiplication factor to 1.00 to solve 0 Hz values when device is not calibrated.
 //  v5.6: Device number stored in NVS, button release to change device number, auto-off when no vibration detected
