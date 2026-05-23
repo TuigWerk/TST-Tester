@@ -33,9 +33,25 @@
       --esp-tools-button-color: #0066cc;
       --esp-tools-button-text-color: white;
     }
+    #unsupported {
+      max-width: 500px;
+      margin: 80px auto;
+      padding: 0 20px;
+      font-family: sans-serif;
+      text-align: center;
+      color: #222;
+    }
+    #unsupported h2 { font-size: 1.3rem; margin-bottom: 12px; }
+    #unsupported p { color: #555; line-height: 1.6; }
   </style>
 </head>
 <body>
+  <div id="unsupported" hidden>
+    <h2>Desktop-Browser erforderlich</h2>
+    <p>Der Firmware-Installer funktioniert nur auf einem Desktop-Computer mit Google Chrome oder Microsoft Edge.<br><br>Bitte öffne diese Seite auf einem PC oder Mac.</p>
+  </div>
+
+  <div id="app" hidden>
   <h1>TST Sensor Firmware-Update</h1>
   <p class="subtitle">Gerät per USB verbinden und auf die Schaltfläche klicken.</p>
 
@@ -91,6 +107,7 @@
       Seitentaste beim Verbinden gedrückt halten, falls das Gerät nicht erkannt wird.
     </p>
   </div> -->
+  </div><!-- #app -->
 
   <script>
     async function loadVersion(manifestPath, elementId) {
@@ -107,6 +124,13 @@
     loadVersion("CP2/manifest.json", "version-cp2");
     loadVersion("CP2-beta/manifest.json", "version-cp2-beta");
     loadVersion("Core2/manifest.json", "version-core2");
+
+    const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    if (isMobile || !("serial" in navigator)) {
+      document.getElementById("unsupported").hidden = false;
+    } else {
+      document.getElementById("app").hidden = false;
+    }
   </script>
 </body>
 </html>
