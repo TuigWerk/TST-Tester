@@ -65,7 +65,14 @@
     <img src="TST Logo 800x600.png" alt="TST Logo">
   </div>
   <h1>TST Sensor Firmware-Update</h1>
-  <p class="subtitle">Gerät per USB verbinden und auf die Schaltfläche klicken.</p>
+  <p class="subtitle" style="margin-bottom: 30px;">
+    <strong>Anleitung:</strong><br><br>
+    1. Klicken Sie auf „Verbinden".<br><br>
+    2. Schließen Sie einen Sensor über das USB-Kabel an Ihren Computer an und prüfen Sie, welcher serielle Anschluss in der Liste angezeigt wird.<br><br>
+    3. Wählen Sie diesen seriellen Anschluss aus und klicken Sie auf „Verbinden". Der Flash-Vorgang beginnt nun.<br><br>
+    4. Warten Sie, bis die Meldung „Fertig" erscheint. Trennen Sie das Kabel während des Flash-Vorgangs nicht.<br><br>
+    5. Sobald das erste Gerät fertig ist, trennen Sie es und wiederholen Sie den Vorgang mit dem nächsten Sensor.
+  </p>
 
   <!-- <div class="device">
     <h2>TST Sensor - CPlus (dark orange)</h2>
@@ -83,8 +90,7 @@
     <esp-web-install-button manifest="CP2-alpha/manifest.json"></esp-web-install-button>
     <p class="instructions">
       Letzte Version mit Frequenz- und Amplitudenmoduswechsel. Zum Downgrade verwenden, falls eine neuere Version nicht funktioniert.<br>
-      Erfordert Google Chrome oder Microsoft Edge.<br>
-      Das Gerät muss eingeschaltet sein, um erkannt zu werden.
+      Erfordert Google Chrome oder Microsoft Edge.
     </p>
   </div>
 
@@ -105,8 +111,7 @@
     <p class="instructions">
       Beta-Firmware zum Testen der gleichzeitigen Frequenz- und Amplitudenmessung sowie schnelleren Aktualisierungsrate.<br>
       Zum Downgrade die stabile Version oben flashen.<br>
-      Erfordert Google Chrome oder Microsoft Edge.<br>
-      Das Gerät muss eingeschaltet sein, um erkannt zu werden.
+      Erfordert Google Chrome oder Microsoft Edge.
     </p>
   </div>
 
@@ -143,6 +148,22 @@
     } else {
       document.getElementById("app").hidden = false;
     }
+
+    // Modify button text to 'Verbinden'
+    document.querySelectorAll('esp-web-install-button').forEach(button => {
+      const modifyButtonText = () => {
+        const shadowButton = button.shadowRoot?.querySelector('button');
+        if (shadowButton) {
+          shadowButton.textContent = 'Verbinden';
+        }
+      };
+      
+      if (button.shadowRoot) {
+        modifyButtonText();
+      } else {
+        setTimeout(modifyButtonText, 500);
+      }
+    });
   </script>
 </body>
 </html>
