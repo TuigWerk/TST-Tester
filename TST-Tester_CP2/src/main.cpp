@@ -24,9 +24,10 @@ Preferences deviceSettings; // Separate namespace for device settings (read-writ
 
 const char *DEVICE_NAME[] = {"TST Sensor 1", "TST Sensor 2", "TST Sensor 3", "TST Sensor 4"};
 
-#define SOFTWARE_VERSION "v5.9 CP2"
+#define SOFTWARE_VERSION "v5.10 CP2"
 
 // Change Log:
+//  v5.10: Median filter (size 3) on frequency output to suppress overlapping-window artifacts.
 //  v5.9: Overlapping FFT windows (75% overlap, HOP_SIZE=256) for 4x faster amplitude response.
 //  v5.8: Combined freq+amplitude pipeline; no mode switching, both characteristics always notified.
 //  v5.7: Set standard multiplication factor to 1.00 to solve 0 Hz values when device is not calibrated.
@@ -89,6 +90,9 @@ RunningAverage RaBatLvl(10);
 RunningMedian ampX_median(MEDIAN_FILTER_SIZE);
 RunningMedian ampY_median(MEDIAN_FILTER_SIZE);
 RunningMedian ampZ_median(MEDIAN_FILTER_SIZE);
+
+// Frequency filtering object
+RunningMedian freq_median(3);
 
 float outputAmpX = 0, outputAmpY = 0, outputAmpZ = 0;
 
@@ -576,10 +580,11 @@ void setup()
   M5.Display.pushImage(0, 0, 145, 135, Arrows);
   refreshDisplay();
 
-  // Clear amplitude filters
+  // Clear amplitude and frequency filters
   ampX_median.clear();
   ampY_median.clear();
   ampZ_median.clear();
+  freq_median.clear();
 
   BatLevel = M5.Power.getBatteryLevel();
   RaBatLvl.fillValue(BatLevel, 10);
@@ -813,12 +818,14 @@ bool MeasureAll(void)
 
   if (raw_amps[best_axis] >= 0.1 && detected_freq >= lowestFreq && detected_freq <= highestFreq)
   {
-    outputFreq = detected_freq;
+    freq_median.add(detected_freq);
+    outputFreq = freq_median.getMedian();
     autoOff = maxAutoOff;
     lastActivityTime = millis();
   }
   else
   {
+    freq_median.clear();
     outputFreq = 0.0;
   }
 
