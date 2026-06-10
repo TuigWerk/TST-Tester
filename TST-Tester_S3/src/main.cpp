@@ -18,15 +18,17 @@
 #include <RunningMedian.h> // Rob Tillaart's RunningMedian library
 #include "FFT.h"           // Replaced ArduinoFFT with FFT.h
 #include <Preferences.h>
+#include <esp_sleep.h>
 
 Preferences preferences;
 Preferences deviceSettings; // Separate namespace for device settings (read-write)
 
 const char *DEVICE_NAME[] = {"TST Sensor 1", "TST Sensor 2", "TST Sensor 3", "TST Sensor 4"};
 
-#define SOFTWARE_VERSION "v5.8 CPlus"
+#define SOFTWARE_VERSION "v5.8 S3"
 
 // Change Log:
+//  v5.8 S3: Port to M5Stick S3 — BMI270 IMU, button GPIO 37, IR pin GPIO 46.
 //  v5.8: Combined freq+amplitude pipeline; no mode switching, both characteristics always notified.
 //  v5.7: Set standard multiplication factor to 1.00 to solve 0 Hz values when device is not calibrated.
 //  v5.6: Device number stored in NVS, button release to change device number, auto-off when no vibration detected
@@ -39,6 +41,7 @@ const char *DEVICE_NAME[] = {"TST Sensor 1", "TST Sensor 2", "TST Sensor 3", "TS
 #define BLE_UUID_AMPX "57fcd116-7fb4-11ed-a1eb-0242ac120002"
 #define BLE_UUID_AMPY "57fcd328-7fb4-11ed-a1eb-0242ac120002"
 #define BLE_UUID_AMPZ "57fcd67a-7fb4-11ed-a1eb-0242ac120002"
+#define BLE_UUID_MODE "57fcd83c-7fb4-11ed-a1eb-0242ac120002"
 
 // NimBLE objects
 NimBLEServer *pServer = nullptr;
@@ -56,6 +59,7 @@ bool prevDeviceConnected = false;
 // FFT Configuration
 #define SAMPLING_FREQ 500.0
 #define FFT_SIZE 1024
+#define HOP_SIZE 1024  // New samples collected per cycle (75% overlap → ~0.5 s update rate)
 
 // Amplitude filtering configuration
 #define MAX_REASONABLE_AMPLITUDE 8.0  // Maximum physically reasonable amplitude in g
@@ -70,8 +74,8 @@ const int BATTERY_LEVEL_MID = 50;
 const int BATTERY_LEVEL_LOW = 25;
 
 // Display brightness constants
-const uint8_t BRIGHTNESS_FULL = 128; // Brightness for active use
-const uint8_t BRIGHTNESS_DIM = 80; // Reduced brightness for better battery life during inactivity
+const uint8_t BRIGHTNESS_FULL = 128;
+const uint8_t BRIGHTNESS_DIM = 1;
 const unsigned long DIM_TIMEOUT = 30000; // Dim after 30 seconds of inactivity
 
 // Sampling buffers — 3 axes, FFT_SIZE samples each
@@ -89,8 +93,8 @@ RunningMedian ampZ_median(MEDIAN_FILTER_SIZE);
 
 float outputAmpX = 0, outputAmpY = 0, outputAmpZ = 0;
 
-const int buttonPin = 35;
-const int ledPin = 19;
+const int buttonPin = 11; // KEY1 on M5StickS3
+const int ledPin = 46;    // IR TX on M5Stick S3
 
 const uint16_t imageWidth = 240;
 const uint16_t imageHeight = 135;
@@ -131,6 +135,7 @@ void refreshDisplay(void);
 void updateBatteryStatus(void);
 void displayBatteryIcon(void);
 void displayConnectionStatus(void);
+void enterDeepSleep(void);
 
 // FFT helper functions
 void parabola(float x1, float y1, float x2, float y2, float x3, float y3, float *a, float *b, float *c)
@@ -466,33 +471,49 @@ class ServerCallbacks : public NimBLEServerCallbacks
 void setup()
 {
   Serial.begin(115200);
-  preferences.begin("Calibration", true);
-
   sampling_period_us = round(1000000 * (1.0 / SAMPLING_FREQ));
 
-  Xzero = preferences.getFloat("Xzero", 0.00);
-  Xfactor = preferences.getFloat("Xfactor", 1.00);
-  Yzero = preferences.getFloat("Yzero", 0.00);
-  Yfactor = preferences.getFloat("Yfactor", 1.00);
-  Zzero = preferences.getFloat("Zzero", 0.00);
-  Zfactor = preferences.getFloat("Zfactor", 1.00);
+  // Read-only: avoids any NVS flash write before M5.begin() initialises the PSRAM/SPI bus.
+  // If calibration has never been run the namespace won't exist; defaults are used silently.
+  if (preferences.begin("Calibration", true)) {
+    Xzero    = preferences.getFloat("Xzero",   0.00);
+    Xfactor  = preferences.getFloat("Xfactor", 1.00);
+    Yzero    = preferences.getFloat("Yzero",   0.00);
+    Yfactor  = preferences.getFloat("Yfactor", 1.00);
+    Zzero    = preferences.getFloat("Zzero",   0.00);
+    Zfactor  = preferences.getFloat("Zfactor", 1.00);
+    preferences.end();
+  }
 
-  // Load device number from persistent storage
-  deviceSettings.begin("DeviceSettings", false); // false = read-write mode
-  deviceNumber = deviceSettings.getUChar("deviceNum", 0);
+  // Load device number from persistent storage (read-only on startup — no flash write risk).
+  if (deviceSettings.begin("DeviceSettings", true)) {
+    deviceNumber = deviceSettings.getUChar("deviceNum", 0);
+    deviceSettings.end();
+  }
   if (deviceNumber > 3)
     deviceNumber = 0; // Sanity check
   Serial.printf("Loaded device number: %d (%s)\n", deviceNumber, DEVICE_NAME[deviceNumber]);
 
+  // Release any I2C slave stuck mid-transaction from a prior crash (SDA held low).
+  // StickS3 internal I2C: SDA=GPIO47, SCL=GPIO48. Toggle SCL 9 times then STOP.
+  pinMode(47, OUTPUT_OPEN_DRAIN);
+  pinMode(48, OUTPUT_OPEN_DRAIN);
+  digitalWrite(47, HIGH);
+  digitalWrite(48, HIGH);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(48, LOW); delayMicroseconds(10);
+    digitalWrite(48, HIGH); delayMicroseconds(10);
+  }
+  digitalWrite(47, LOW); delayMicroseconds(10);  // STOP: SDA low while SCL high
+  digitalWrite(47, HIGH); delayMicroseconds(10);
+
   auto cfg = M5.config();
   M5.begin(cfg);
 
-  // Increase IMU sample rate to 1kHz (SMPLRT_DIV = 0)
-  Wire1.beginTransmission(0x68); // MPU6886 I2C address
-  Wire1.write(0x19);             // SMPLRT_DIV register
-  Wire1.write(0x00);             // Divider = 0 -> 1000 Hz output rate
-  Wire1.endTransmission();
-  Serial.println("IMU sample rate set to 1kHz");
+  // Set BMI270 accelerometer ODR to 800 Hz via M5Unified's internal I2C driver.
+  // ACC_CONF (0x40): bit7=perf_mode, bits[6:4]=normal BW (0x2), bits[3:0]=800Hz ODR (0xC)
+  M5.In_I2C.writeRegister8(0x68, 0x40, 0xAC, 400000);
+  Serial.println("IMU sample rate set to 800 Hz");
 
   M5.Display.setRotation(1);
   M5.Display.setTextColor(WHITE);
@@ -535,7 +556,7 @@ void setup()
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
   pModeChar = pAccService->createCharacteristic(
-      "57fcd83c-7fb4-11ed-a1eb-0242ac120002",
+      BLE_UUID_MODE,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
 
   // Set initial values
@@ -611,6 +632,7 @@ void loop()
   M5.update();
   M5.Imu.update();
 
+  // Button handling: short press = change device number, long press (≥2s held) = power off
   if (millis() - pressTime > debounceInterval)
   {
     buttonState = digitalRead(buttonPin);
@@ -618,15 +640,18 @@ void loop()
     {
       if (buttonState == false && prevButtonState == true && millis() > startupDelay)
       {
+        // Button pressed — record start time and beep
         pressStartTime = millis();
         M5.Speaker.tone(SpeakerTone, 50);
       }
 
       if (buttonState == true && prevButtonState == false && millis() > startupDelay)
       {
-        pressTime = millis(); // debounce: ignore re-triggers for 200ms after release
+        // Button released
+        pressTime = millis();
         lastActivityTime = millis();
 
+        // Short press only (long press is handled mid-hold below)
         if (!deviceConnected && (millis() - pressStartTime) < 2000)
         {
           if (deviceNumber < 3)
@@ -637,8 +662,10 @@ void loop()
           {
             deviceNumber = 0;
           }
-          // Save device number to persistent storage
+          // Save device number to persistent storage (open R/W only when actually writing).
+          deviceSettings.begin("DeviceSettings", false);
           deviceSettings.putUChar("deviceNum", deviceNumber);
+          deviceSettings.end();
           Serial.printf("Saved device number: %d\n", deviceNumber);
 
           refreshDisplay();
@@ -655,7 +682,7 @@ void loop()
           pAmpxChar = pAccService->createCharacteristic(BLE_UUID_AMPX, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
           pAmpyChar = pAccService->createCharacteristic(BLE_UUID_AMPY, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
           pAmpzChar = pAccService->createCharacteristic(BLE_UUID_AMPZ, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-          pModeChar = pAccService->createCharacteristic("57fcd83c-7fb4-11ed-a1eb-0242ac120002", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+          pModeChar = pAccService->createCharacteristic(BLE_UUID_MODE, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
           pAccService->start();
           pAdvertising = NimBLEDevice::getAdvertising();
           pAdvertising->addServiceUUID(BLE_UUID_ACC_SERVICE);
@@ -664,6 +691,13 @@ void loop()
       }
     }
     prevButtonState = buttonState;
+  }
+
+  // Long press: power off while still holding after 2 seconds
+  if (buttonState == false && pressStartTime > 0 && (millis() - pressStartTime) >= 2000)
+  {
+    pressStartTime = 0; // prevent repeated triggers
+    enterDeepSleep();
   }
 
   // Periodic battery status check
@@ -736,38 +770,66 @@ void loop()
     }
   }
 
-  // Auto power off — suppressed while BLE client is connected
-  if (!deviceConnected && millis() - lastActivityTime > autoOff)
+  // Auto power off (timeout varies by state: 5min default, 2min after BLE, 1min when full)
+  if (millis() - lastActivityTime > autoOff)
   {
-    M5.Power.powerOff();
+    enterDeepSleep();
   }
 }
 
 bool MeasureAll(void)
 {
-  static bool collection_complete = false;
+  static bool buffer_primed = false;
+  static int priming_pos = 0;
   static unsigned long collection_start = 0;
 
-  // Phase 1: Collect FFT_SIZE samples on all 3 axes simultaneously
-  if (!collection_complete)
+  collection_start = millis();
+
+  if (!buffer_primed)
   {
-    collection_start = millis();
-    for (int i = 0; i < FFT_SIZE; i++)
+    // Fill buffer incrementally HOP_SIZE samples at a time until FFT_SIZE is reached
+    int to_collect = min(HOP_SIZE, FFT_SIZE - priming_pos);
+    for (int i = 0; i < to_collect; i++)
     {
       unsigned long newTime = micros();
       M5.Imu.update();
       auto data = M5.Imu.getImuData();
-      measure_buffers[0][i] = (data.accel.x - Xzero) * Xfactor;
-      measure_buffers[1][i] = (data.accel.y - Yzero) * Yfactor;
-      measure_buffers[2][i] = (data.accel.z - Zzero) * Zfactor;
-      while ((micros() - newTime) < sampling_period_us) { /* chill */ }
+      measure_buffers[0][priming_pos + i] = (data.accel.x - Xzero) * Xfactor;
+      measure_buffers[1][priming_pos + i] = (data.accel.y - Yzero) * Yfactor;
+      measure_buffers[2][priming_pos + i] = (data.accel.z - Zzero) * Zfactor;
+      while ((micros() - newTime) < sampling_period_us) {}
     }
-    collection_complete = true;
-    Serial.printf("Collection: %lu ms\n", millis() - collection_start);
-    return false;
+    priming_pos += to_collect;
+    Serial.printf("Priming: %d/%d samples (%lu ms)\n", priming_pos, FFT_SIZE, millis() - collection_start);
+    if (priming_pos < FFT_SIZE)
+      return false;
+    buffer_primed = true;
+    // Fall through to run FFT on the now-full buffer
+  }
+  else
+  {
+    // Slide buffer left by HOP_SIZE, collect HOP_SIZE new samples at the end
+    for (int axis = 0; axis < 3; axis++)
+    {
+      memmove(measure_buffers[axis],
+              measure_buffers[axis] + HOP_SIZE,
+              (FFT_SIZE - HOP_SIZE) * sizeof(float));
+    }
+    for (int i = 0; i < HOP_SIZE; i++)
+    {
+      unsigned long newTime = micros();
+      M5.Imu.update();
+      auto data = M5.Imu.getImuData();
+      int idx = FFT_SIZE - HOP_SIZE + i;
+      measure_buffers[0][idx] = (data.accel.x - Xzero) * Xfactor;
+      measure_buffers[1][idx] = (data.accel.y - Yzero) * Yfactor;
+      measure_buffers[2][idx] = (data.accel.z - Zzero) * Zfactor;
+      while ((micros() - newTime) < sampling_period_us) {}
+    }
+    Serial.printf("Hop collection: %lu ms\n", millis() - collection_start);
   }
 
-  // Phase 2: Run amplitude FFT on all 3 axes, frequency FFT on best axis
+  // Run amplitude FFT on all 3 axes, frequency FFT on best axis
   float raw_amps[3];
   for (int axis = 0; axis < 3; axis++)
     raw_amps[axis] = calculateFFTAmplitude(measure_buffers[axis], FFT_SIZE);
@@ -799,15 +861,10 @@ bool MeasureAll(void)
     lastActivityTime = millis();
   }
 
-  Serial.printf("Freq: %.2f Hz (axis %d) | Amp X=%.3f Y=%.3f Z=%.3f | %lu ms\n",
+  Serial.printf("Freq: %.2f Hz (axis %d) | Amp X=%.3f Y=%.3f Z=%.3f | total %lu ms\n",
     outputFreq, best_axis, outputAmpX, outputAmpY, outputAmpZ, millis() - collection_start);
 
   refreshDisplay();
-  digitalWrite(ledPin, HIGH);
-  delayMicroseconds(10000);
-  digitalWrite(ledPin, LOW);
-
-  collection_complete = false;
   return true;
 }
 
@@ -875,4 +932,41 @@ void displayConnectionStatus(void)
   {
     M5.Display.pushImage(0, 0, 145, 135, Arrows);
   }
+}
+
+void enterDeepSleep(void)
+{
+  M5.Display.fillScreen(BLACK);
+  M5.Display.setTextDatum(MC_DATUM);
+  M5.Display.setFont(&fonts::FreeSansBold9pt7b);
+  M5.Display.drawString("Sleeping...", M5.Display.width() / 2, M5.Display.height() / 2);
+  delay(500);
+
+  // Stop BLE radio — largest current draw when awake
+  NimBLEDevice::deinit(true);
+
+  // Send SLEEP_IN command to display controller and cut backlight
+  M5.Display.sleep();
+
+  // Ensure IR LED is off
+  digitalWrite(ledPin, LOW);
+
+  // Disable M5PM1 LED power (register 0x06 bit 4) to turn off the RGB status LED.
+  // Note: if USB is connected the charger STAT pin drives the green LED in hardware —
+  // that one cannot be turned off in software.
+  M5.In_I2C.bitOff(0x6E, 0x06, 1 << 4, 100000);
+
+  // Ensure PA (speaker amplifier) stays off: M5PM1 GPIO3 = LOW (register 0x11 bit 3)
+  M5.In_I2C.bitOff(0x6E, 0x11, 1 << 3, 100000);
+
+  // Wait for KEY1 to be released before arming the wakeup.
+  // If the button is still held when esp_deep_sleep_start() is called the LOW
+  // wakeup condition is already true and the device wakes up immediately.
+  while (digitalRead(buttonPin) == LOW) {
+    delay(10);
+  }
+  delay(50); // debounce after release
+
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_11, LOW); // KEY1 wakes device
+  esp_deep_sleep_start();
 }
