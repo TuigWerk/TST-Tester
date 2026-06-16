@@ -176,7 +176,7 @@
       if (dialog.dataset.autoCloseArmed) return;
       dialog.dataset.autoCloseArmed = 'true';
       const observer = new MutationObserver(() => {
-        if (dialog.shadowRoot?.textContent?.includes('Installation complete')) {
+        if (dialog.shadowRoot?.querySelector('ewt-page-message[label="Installation complete!"]')) {
           observer.disconnect();
           setTimeout(() => {
             dialog.shadowRoot?.querySelector('ew-dialog')?.close();
