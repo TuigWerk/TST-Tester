@@ -70,8 +70,8 @@
     1. Wählen Sie eine Firmware-Version aus und klicken Sie auf <strong>„Verbinden".</strong><br><br>
     2. Schließen Sie einen Sensor über das USB-Kabel an Ihren Computer an und prüfen Sie, welcher serielle Anschluss neu in der Liste erscheint.<br><br>
     3. Wählen Sie diesen seriellen Anschluss aus und klicken Sie auf „Verbinden". Bestätigen Sie zweimal die Installation.<br><br>
-    4. Der Flash-Vorgang beginnt nun. Warten Sie, bis die Meldung „Fertig" erscheint. Trennen Sie das Kabel während des Flash-Vorgangs nicht.<br><br>
-    5. Sobald das erste Gerät fertig ist, trennen Sie es und wiederholen Sie den Vorgang mit dem nächsten Sensor.
+    4. Der Flash-Vorgang beginnt nun. Warten Sie, bis die Meldung „Installation complete" erscheint. Trennen Sie das Kabel während des Flash-Vorgangs nicht. Das Fenster schließt sich danach automatisch.<br><br>
+    5. Trennen Sie den fertigen Sensor, schließen Sie den nächsten an und klicken Sie erneut auf „Verbinden", um den neuen seriellen Anschluss auszuwählen.
   </p>
 
   <!-- <div class="device">
@@ -157,13 +157,37 @@
           shadowButton.textContent = 'Verbinden';
         }
       };
-      
+
       if (button.shadowRoot) {
         modifyButtonText();
       } else {
         setTimeout(modifyButtonText, 500);
       }
     });
+
+    // ESP Web Tools keeps its install dialog (and the serial port it was
+    // given) open after a flash finishes; clicking "Next" only switches to
+    // an internal dashboard view instead of releasing the port. That means
+    // the next "Verbinden" click on a fresh device never re-prompts for a
+    // port. Auto-close the dialog as soon as the install succeeds so the
+    // user has to click "Verbinden" again, which always triggers a new
+    // serial port picker.
+    const armAutoClose = (dialog) => {
+      if (dialog.dataset.autoCloseArmed) return;
+      dialog.dataset.autoCloseArmed = 'true';
+      const observer = new MutationObserver(() => {
+        if (dialog.shadowRoot?.querySelector('ewt-page-message[label="Installation complete!"]')) {
+          observer.disconnect();
+          setTimeout(() => {
+            dialog.shadowRoot?.querySelector('ew-dialog')?.close();
+          }, 1500);
+        }
+      });
+      observer.observe(dialog.shadowRoot, { childList: true, subtree: true, characterData: true });
+    };
+    new MutationObserver(() => {
+      document.querySelectorAll('ewt-install-dialog').forEach(armAutoClose);
+    }).observe(document.body, { childList: true });
   </script>
 </body>
 </html>
