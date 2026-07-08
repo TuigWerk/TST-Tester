@@ -959,6 +959,12 @@ void enterDeepSleep(void)
   // Ensure PA (speaker amplifier) stays off: M5PM1 GPIO3 = LOW (register 0x11 bit 3)
   M5.In_I2C.bitOff(0x6E, 0x11, 1 << 3, 100000);
 
+  // Suspend the BMI270 IMU. It runs continuously at 800 Hz in full performance
+  // mode (~850 uA) and its power rail stays on through ESP32 deep sleep, so
+  // without this it alone draws far more current than the whole sleeping ESP32.
+  M5.In_I2C.writeRegister8(0x68, 0x7D, 0x00, 400000); // PWR_CTRL: disable acc/gyr/aux/temp
+  M5.In_I2C.writeRegister8(0x68, 0x7C, 0x01, 400000); // PWR_CONF: enable advanced power save (suspend)
+
   // Wait for KEY1 to be released before arming the wakeup.
   // If the button is still held when esp_deep_sleep_start() is called the LOW
   // wakeup condition is already true and the device wakes up immediately.
