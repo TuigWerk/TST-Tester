@@ -1,2 +1,5 @@
 .pio/
 .claude/
+
+# PDFs (datasheets, manuals, generated reports)
+*.pdf
