@@ -3,6 +3,7 @@
 #include <NimBLEDevice.h>
 #include "Arduino.h"
 #include <Wire.h>
+#include <M5PM1.h>
 #include "TSTLogo.h"
 #include "Arrows.h"
 #include "Bluetooth.h"
@@ -18,16 +19,21 @@
 #include <RunningMedian.h> // Rob Tillaart's RunningMedian library
 #include "FFT.h"           // Replaced ArduinoFFT with FFT.h
 #include <Preferences.h>
-#include <esp_sleep.h>
 
 Preferences preferences;
 Preferences deviceSettings; // Separate namespace for device settings (read-write)
 
+M5PM1 pm1;
+
+
 const char *DEVICE_NAME[] = {"TST Sensor 1", "TST Sensor 2", "TST Sensor 3", "TST Sensor 4"};
 
-#define SOFTWARE_VERSION "v5.8 S3"
+#define SOFTWARE_VERSION "v5.9 S3"
 
 // Change Log:
+//  v5.9 S3: Single-button control via PM1 power button — short click cycles sensor number,
+//           long press triggers PM1 hardware power-off, M5.Power.powerOff() for auto-off,
+//           PM1 single-reset disabled so click fires IRQ only (no MCU reset).
 //  v5.8 S3: Port to M5Stick S3 — BMI270 IMU, button GPIO 37, IR pin GPIO 46.
 //  v5.8: Combined freq+amplitude pipeline; no mode switching, both characteristics always notified.
 //  v5.7: Set standard multiplication factor to 1.00 to solve 0 Hz values when device is not calibrated.
@@ -93,7 +99,6 @@ RunningMedian ampZ_median(MEDIAN_FILTER_SIZE);
 
 float outputAmpX = 0, outputAmpY = 0, outputAmpZ = 0;
 
-const int buttonPin = 11; // KEY1 on M5StickS3
 const int ledPin = 46;    // IR TX on M5Stick S3
 
 const uint16_t imageWidth = 240;
@@ -105,9 +110,6 @@ int BatLvlAvg;
 float Xzero, Yzero, Zzero;
 float Xfactor, Yfactor, Zfactor;
 
-unsigned long pressTime;
-unsigned long pressStartTime = 0;
-unsigned long debounceInterval = 200;
 unsigned long refreshTime;
 unsigned long refreshInterval = 2000;
 unsigned long updateBatTime;
@@ -125,8 +127,6 @@ float outputFreq = 0.0;
 const int SpeakerTone = 4000;
 
 byte deviceNumber = 0; // Initialize to 0 (TST Sensor 1)
-bool buttonState = false;
-bool prevButtonState = false;
 bool isDimmed = false;
 
 // Function declarations
@@ -135,8 +135,6 @@ void refreshDisplay(void);
 void updateBatteryStatus(void);
 void displayBatteryIcon(void);
 void displayConnectionStatus(void);
-void enterDeepSleep(void);
-
 // FFT helper functions
 void parabola(float x1, float y1, float x2, float y2, float x3, float y3, float *a, float *b, float *c)
 {
@@ -510,6 +508,15 @@ void setup()
   auto cfg = M5.config();
   M5.begin(cfg);
 
+  // Initialize PM1 for power button. Must use Wire1 — M5.begin() maps M5.In_I2C to Wire1
+  // on the internal I2C pins; Wire (Wire0) is unconfigured and will timeout.
+  {
+    delay(2000);
+    auto pin_num_sda = M5.getPin(m5::pin_name_t::in_i2c_sda);
+    auto pin_num_scl = M5.getPin(m5::pin_name_t::in_i2c_scl);
+    pm1.begin(&Wire1, M5PM1_DEFAULT_ADDR, pin_num_sda, pin_num_scl, M5PM1_I2C_FREQ_100K);
+  }
+
   // Set BMI270 accelerometer ODR to 800 Hz via M5Unified's internal I2C driver.
   // ACC_CONF (0x40): bit7=perf_mode, bits[6:4]=normal BW (0x2), bits[3:0]=800Hz ODR (0xC)
   M5.In_I2C.writeRegister8(0x68, 0x40, 0xAC, 400000);
@@ -521,8 +528,17 @@ void setup()
   M5.Display.setTextSize(1);
   M5.Display.setBrightness(BRIGHTNESS_FULL);
 
-  pinMode(buttonPin, INPUT);
-  prevButtonState = digitalRead(buttonPin); // Initialize to actual state to prevent false trigger on boot
+  // Configure PM1 button behaviour.
+  // PM1 is always-on powered and retains register state across ESP32 reboots as long
+  // as the battery is connected, so we must explicitly write each bit we care about.
+  //   BTN_CFG_1 (0x49) SINGLE_RST_DIS (bit 0): single-click does not reset MCU.
+  //   BTN_CFG_1 (0x49) DL_LOCK        (bit 7): long-hold does not enter download mode.
+  //   BTN_CFG_2 (0x4A) DOUBLE_OFF_DIS (bit 0): CLEARED so double-click powers off.
+  uint8_t btn_cfg = M5.In_I2C.readRegister8(0x6E, 0x49, 100000);
+  M5.In_I2C.writeRegister8(0x6E, 0x49, btn_cfg | 0x81, 100000);
+  uint8_t btn_cfg2 = M5.In_I2C.readRegister8(0x6E, 0x4A, 100000);
+  M5.In_I2C.writeRegister8(0x6E, 0x4A, btn_cfg2 & ~0x01, 100000);
+
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW);
 
@@ -629,75 +645,44 @@ void setup()
 
 void loop()
 {
+  M5.delay(1);
   M5.update();
   M5.Imu.update();
 
-  // Button handling: short press = change device number, long press (≥2s held) = power off
-  if (millis() - pressTime > debounceInterval)
+  // Feed PM1 power button state into M5.BtnPWR.
   {
-    buttonState = digitalRead(buttonPin);
-    if (buttonState != prevButtonState)
-    {
-      if (buttonState == false && prevButtonState == true && millis() > startupDelay)
-      {
-        // Button pressed — record start time and beep
-        pressStartTime = millis();
-        M5.Speaker.tone(SpeakerTone, 50);
-      }
-
-      if (buttonState == true && prevButtonState == false && millis() > startupDelay)
-      {
-        // Button released
-        pressTime = millis();
-        lastActivityTime = millis();
-
-        // Short press only (long press is handled mid-hold below)
-        if (!deviceConnected && (millis() - pressStartTime) < 2000)
-        {
-          if (deviceNumber < 3)
-          {
-            deviceNumber++;
-          }
-          else
-          {
-            deviceNumber = 0;
-          }
-          // Save device number to persistent storage (open R/W only when actually writing).
-          deviceSettings.begin("DeviceSettings", false);
-          deviceSettings.putUChar("deviceNum", deviceNumber);
-          deviceSettings.end();
-          Serial.printf("Saved device number: %d\n", deviceNumber);
-
-          refreshDisplay();
-          Serial.println(DEVICE_NAME[deviceNumber]);
-          // Update BLE device name (requires restart advertising)
-          NimBLEDevice::deinit(true);
-          delay(100);
-          NimBLEDevice::init(DEVICE_NAME[deviceNumber]);
-          // Reinitialize BLE (simplified - in production you'd refactor this)
-          pServer = NimBLEDevice::createServer();
-          pServer->setCallbacks(new ServerCallbacks());
-          pAccService = pServer->createService(BLE_UUID_ACC_SERVICE);
-          pFreqChar = pAccService->createCharacteristic(BLE_UUID_FREQ, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-          pAmpxChar = pAccService->createCharacteristic(BLE_UUID_AMPX, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-          pAmpyChar = pAccService->createCharacteristic(BLE_UUID_AMPY, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-          pAmpzChar = pAccService->createCharacteristic(BLE_UUID_AMPZ, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-          pModeChar = pAccService->createCharacteristic(BLE_UUID_MODE, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-          pAccService->start();
-          pAdvertising = NimBLEDevice::getAdvertising();
-          pAdvertising->addServiceUUID(BLE_UUID_ACC_SERVICE);
-          NimBLEDevice::startAdvertising();
-        }
-      }
-    }
-    prevButtonState = buttonState;
+    bool b;
+    pm1.btnGetState(&b);
+    M5.BtnPWR.setRawState(millis(), b);
   }
 
-  // Long press: power off while still holding after 2 seconds
-  if (buttonState == false && pressStartTime > 0 && (millis() - pressStartTime) >= 2000)
+  // BtnA or BtnPWR: cycle sensor number when not connected via BLE.
+  if ((M5.BtnA.wasClicked() || M5.BtnPWR.wasClicked()) && !deviceConnected && millis() > startupDelay)
   {
-    pressStartTime = 0; // prevent repeated triggers
-    enterDeepSleep();
+    lastActivityTime = millis();
+    M5.Speaker.tone(SpeakerTone, 50);
+    deviceNumber = (deviceNumber < 3) ? deviceNumber + 1 : 0;
+    deviceSettings.begin("DeviceSettings", false);
+    deviceSettings.putUChar("deviceNum", deviceNumber);
+    deviceSettings.end();
+    Serial.printf("Saved device number: %d\n", deviceNumber);
+    refreshDisplay();
+    Serial.println(DEVICE_NAME[deviceNumber]);
+    NimBLEDevice::deinit(true);
+    delay(100);
+    NimBLEDevice::init(DEVICE_NAME[deviceNumber]);
+    pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+    pAccService = pServer->createService(BLE_UUID_ACC_SERVICE);
+    pFreqChar = pAccService->createCharacteristic(BLE_UUID_FREQ, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pAmpxChar = pAccService->createCharacteristic(BLE_UUID_AMPX, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pAmpyChar = pAccService->createCharacteristic(BLE_UUID_AMPY, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pAmpzChar = pAccService->createCharacteristic(BLE_UUID_AMPZ, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pModeChar = pAccService->createCharacteristic(BLE_UUID_MODE, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pAccService->start();
+    pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(BLE_UUID_ACC_SERVICE);
+    NimBLEDevice::startAdvertising();
   }
 
   // Periodic battery status check
@@ -770,10 +755,10 @@ void loop()
     }
   }
 
-  // Auto power off (timeout varies by state: 5min default, 2min after BLE, 1min when full)
+  // Auto power off (timeout varies by state: 5min default, 2min after BLE disconnect)
   if (millis() - lastActivityTime > autoOff)
   {
-    enterDeepSleep();
+    M5.Power.powerOff();
   }
 }
 
@@ -934,45 +919,3 @@ void displayConnectionStatus(void)
   }
 }
 
-void enterDeepSleep(void)
-{
-  M5.Display.fillScreen(BLACK);
-  M5.Display.setTextDatum(MC_DATUM);
-  M5.Display.setFont(&fonts::FreeSansBold9pt7b);
-  M5.Display.drawString("Sleeping...", M5.Display.width() / 2, M5.Display.height() / 2);
-  delay(500);
-
-  // Stop BLE radio — largest current draw when awake
-  NimBLEDevice::deinit(true);
-
-  // Send SLEEP_IN command to display controller and cut backlight
-  M5.Display.sleep();
-
-  // Ensure IR LED is off
-  digitalWrite(ledPin, LOW);
-
-  // Disable M5PM1 LED power (register 0x06 bit 4) to turn off the RGB status LED.
-  // Note: if USB is connected the charger STAT pin drives the green LED in hardware —
-  // that one cannot be turned off in software.
-  M5.In_I2C.bitOff(0x6E, 0x06, 1 << 4, 100000);
-
-  // Ensure PA (speaker amplifier) stays off: M5PM1 GPIO3 = LOW (register 0x11 bit 3)
-  M5.In_I2C.bitOff(0x6E, 0x11, 1 << 3, 100000);
-
-  // Suspend the BMI270 IMU. It runs continuously at 800 Hz in full performance
-  // mode (~850 uA) and its power rail stays on through ESP32 deep sleep, so
-  // without this it alone draws far more current than the whole sleeping ESP32.
-  M5.In_I2C.writeRegister8(0x68, 0x7D, 0x00, 400000); // PWR_CTRL: disable acc/gyr/aux/temp
-  M5.In_I2C.writeRegister8(0x68, 0x7C, 0x01, 400000); // PWR_CONF: enable advanced power save (suspend)
-
-  // Wait for KEY1 to be released before arming the wakeup.
-  // If the button is still held when esp_deep_sleep_start() is called the LOW
-  // wakeup condition is already true and the device wakes up immediately.
-  while (digitalRead(buttonPin) == LOW) {
-    delay(10);
-  }
-  delay(50); // debounce after release
-
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_11, LOW); // KEY1 wakes device
-  esp_deep_sleep_start();
-}
